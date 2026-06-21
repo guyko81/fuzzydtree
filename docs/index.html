@@ -167,6 +167,21 @@
       color: #a5f3fc;
     }
     .install-box span { color: #94a3b8; }
+    .copy-btn {
+      background: none;
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 6px;
+      color: #94a3b8;
+      cursor: pointer;
+      padding: 4px 8px;
+      font-size: 0.8rem;
+      transition: all 0.2s;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .copy-btn:hover { background: rgba(255,255,255,0.1); color: #e2e8f0; }
+    .copy-btn.copied { color: #4ade80; border-color: #4ade80; }
 
     /* SECTION STYLES */
     section h2 {
@@ -425,6 +440,7 @@
   </div>
   <div class="nav-right">
     <a href="https://github.com/guyko81/fuzzydtree">GitHub</a>
+    <a href="https://pypi.org/project/fuzzydtree/">PyPI</a>
   </div>
 </nav>
 
@@ -440,11 +456,14 @@
         <p class="tagline">
           Decision trees with smooth fuzzy splits for regression and classification &mdash; interpretable, smooth, and sklearn-compatible.
         </p>
-        <p style="margin-top:14px;">
-          <code style="font-size:0.95em; padding:6px 10px;">pip install FuzzyDTree</code>
-        </p>
       </div>
       <div style="display:flex; flex-direction:column; align-items:flex-end; gap:10px; flex-shrink:0;">
+        <div class="install-box">
+          <span>$</span> pip install FuzzyDTree
+          <button class="copy-btn" onclick="copyCmd(this, 'pip install FuzzyDTree')">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+          </button>
+        </div>
         <div class="hero-cta" style="margin-top:0;">
           <a class="btn-primary" onclick="showPage('regressor')">Regressor</a>
           <a class="btn-secondary" onclick="showPage('classifier')">Classifier</a>
@@ -637,6 +656,7 @@
     <div class="container">
       <p>
         <a href="https://github.com/guyko81/fuzzydtree">GitHub</a> &nbsp;&middot;&nbsp;
+        <a href="https://pypi.org/project/fuzzydtree/">PyPI</a> &nbsp;&middot;&nbsp;
         MIT License
       </p>
       <p style="margin-top: 8px;">Gabor Gulyas &copy; 2025&ndash;2026</p>
@@ -879,6 +899,7 @@ model.<span class="fn">plot_feature_contributions</span>(
     <div class="container">
       <p>
         <a href="https://github.com/guyko81/fuzzydtree">GitHub</a> &nbsp;&middot;&nbsp;
+        <a href="https://pypi.org/project/fuzzydtree/">PyPI</a> &nbsp;&middot;&nbsp;
         MIT License
       </p>
       <p style="margin-top: 8px;">Gabor Gulyas &copy; 2025&ndash;2026</p>
@@ -1173,6 +1194,7 @@ score  = clf.<span class="fn">score</span>(X_test, y_test)</pre>
     <div class="container">
       <p>
         <a href="https://github.com/guyko81/fuzzydtree">GitHub</a> &nbsp;&middot;&nbsp;
+        <a href="https://pypi.org/project/fuzzydtree/">PyPI</a> &nbsp;&middot;&nbsp;
         MIT License
       </p>
       <p style="margin-top: 8px;">Gabor Gulyas &copy; 2025&ndash;2026</p>
@@ -1336,6 +1358,7 @@ score  = clf.<span class="fn">score</span>(X_test, y_test)</pre>
     <div class="container">
       <p>
         <a href="https://github.com/guyko81/fuzzydtree">GitHub</a> &nbsp;&middot;&nbsp;
+        <a href="https://pypi.org/project/fuzzydtree/">PyPI</a> &nbsp;&middot;&nbsp;
         MIT License
       </p>
       <p style="margin-top: 8px;">Gabor Gulyas &copy; 2025&ndash;2026</p>
@@ -1492,6 +1515,7 @@ score  = clf.<span class="fn">score</span>(X_test, y_test)</pre>
     <div class="container">
       <p>
         <a href="https://github.com/guyko81/fuzzydtree">GitHub</a> &nbsp;&middot;&nbsp;
+        <a href="https://pypi.org/project/fuzzydtree/">PyPI</a> &nbsp;&middot;&nbsp;
         MIT License
       </p>
       <p style="margin-top: 8px;">Gabor Gulyas &copy; 2025&ndash;2026</p>
@@ -1504,6 +1528,17 @@ score  = clf.<span class="fn">score</span>(X_test, y_test)</pre>
      JAVASCRIPT
      ══════════════════════════════════════════════════════════════════ -->
 <script>
+function copyCmd(btn, text) {
+  navigator.clipboard.writeText(text).then(function() {
+    btn.classList.add('copied');
+    btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>';
+    setTimeout(function() {
+      btn.classList.remove('copied');
+      btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>';
+    }, 2000);
+  });
+}
+
 // Page navigation
 function showPage(name) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
