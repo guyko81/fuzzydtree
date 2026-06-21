@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel", "numpy"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "FuzzyDTree"
+version = "0.1.1"
+description = "Adaptive fuzzy decision trees for regression and classification."
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Guy Korman" }
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+keywords = [
+    "decision-tree",
+    "fuzzy-logic",
+    "machine-learning",
+    "regression",
+    "classification"
+]
+dependencies = [
+    "numpy",
+    "numba",
+    "scikit-learn"
+]
+
+[project.optional-dependencies]
+dataframe = ["pandas"]
+plot = ["matplotlib"]
+dev = ["pytest", "matplotlib", "pandas"]
+
+[project.urls]
+Homepage = "https://guyko81.github.io/fuzzydtree/"
+Repository = "https://github.com/guyko81/fuzzydtree"
+
+[tool.setuptools]
+packages = ["fuzzydtree"]
