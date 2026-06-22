@@ -220,6 +220,23 @@ def test_fast_numeric_prediction_matches_leaf_weights():
     print("  PASSED\n")
 
 
+def test_margin_grid_includes_hard_and_tiny_candidates():
+    """Margin grid should include a hard split plus tiny fuzzy widths."""
+    ft = FuzzyTreeClassifier(
+        margin_grid_size=4,
+        margin_min_scale=1e-4,
+        margin_max_scale=20.0,
+        include_hard_splits=True,
+    )
+    margins = ft._margin_candidates(2.0)
+    np.testing.assert_allclose(margins[0], 0.0)
+    np.testing.assert_allclose(margins[1], 2.0e-4)
+    np.testing.assert_allclose(margins[-1], 40.0)
+    assert len(margins) == 5
+    print(f"  margin candidates = {margins}")
+    print("  PASSED\n")
+
+
 def test_c_mse_split_backend_matches_numba():
     """Compiled C split kernel should match the reference Numba kernel."""
     if _c_backend is None:
@@ -268,6 +285,9 @@ def test_c_depth_first_grower_matches_python_builder():
         max_depth=4,
         max_bins=32,
         margin_grid_size=3,
+        margin_min_scale=0.4,
+        margin_max_scale=20.0,
+        include_hard_splits=False,
         random_state=0,
         optimize_split_gain=True,
         optimize_leaf_values=False,
@@ -578,6 +598,7 @@ if __name__ == "__main__":
         ("Regressor: categorical", test_regressor_categorical),
         ("Regressor: new params validation", test_regressor_new_params_validation),
         ("Regressor: fast numeric prediction", test_fast_numeric_prediction_matches_leaf_weights),
+        ("Base tree: margin grid", test_margin_grid_includes_hard_and_tiny_candidates),
         ("Regressor: C MSE split backend", test_c_mse_split_backend_matches_numba),
         ("Regressor: C depth-first grower", test_c_depth_first_grower_matches_python_builder),
         # Classifier

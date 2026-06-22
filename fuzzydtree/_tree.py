@@ -151,6 +151,31 @@ class FuzzyDTree:
     max_cat_threshold : int, default=64
     random_state : int or None, default=None
     margin_grid_size : int, default=10
+    margin_min_scale : float, default=1e-4
+        Smallest non-zero fuzzy half-width as a multiple of local weighted
+        feature standard deviation.
+    margin_max_scale : float, default=20.0
+        Largest fuzzy half-width as a multiple of local weighted feature
+        standard deviation.
+    include_hard_splits : bool, default=True
+        If True, include margin=0 as an exact step-function candidate.
+    margin_cv_folds : int, default=0
+        If >= 2, choose each split's fuzzy margin by k-fold cross-validation
+        instead of training-impurity reduction. The split feature and threshold
+        are still picked greedily on training impurity; then, holding them
+        fixed, the margin grid (including the hard ``margin=0`` candidate) is
+        scored by out-of-fold loss and the best margin is kept. Because a hard
+        boundary always wins on *training* impurity, this is the mechanism that
+        lets a margin > 0 be selected only when smoothing actually generalises.
+        ``0`` disables CV and restores the historical greedy behaviour.
+    margin_cv_repeats : int, default=1
+        Number of independent k-fold partitions to average when scoring each
+        split's margin grid. A single partition gives a noisy out-of-fold loss
+        curve whose ``argmin`` jitters from seed to seed; averaging ``R``
+        partitions reduces that selection variance by roughly ``sqrt(R)``,
+        making the fitted tree markedly more stable across ``random_state``
+        values at ``R`` times the CV cost. Ignored when ``margin_cv_folds`` is
+        ``0``.
     max_bins : int, default=256
     margin_depth_decay : float, default=1.0
     min_train_weight_fraction : float, default=0.01
@@ -160,9 +185,12 @@ class FuzzyDTree:
     def __init__(self, *, max_depth=5, max_leaves=None, min_samples_leaf=1.0,
                  max_features=None, categorical_features=None,
                  max_cat_threshold=64, random_state=None,
-                 margin_grid_size=10, max_bins=256,
+                 margin_grid_size=10, margin_min_scale=1e-4,
+                 margin_max_scale=20.0, include_hard_splits=True,
+                 max_bins=256,
                  margin_depth_decay=1.0, min_train_weight_fraction=0.01,
-                 prebin_numeric=True):
+                 prebin_numeric=True, margin_cv_folds=10,
+                 margin_cv_repeats=3):
         self.max_depth = max_depth
         self.max_leaves = max_leaves
         self.min_samples_leaf = min_samples_leaf
@@ -171,10 +199,15 @@ class FuzzyDTree:
         self.max_cat_threshold = max_cat_threshold
         self.random_state = random_state
         self.margin_grid_size = margin_grid_size
+        self.margin_min_scale = margin_min_scale
+        self.margin_max_scale = margin_max_scale
+        self.include_hard_splits = include_hard_splits
         self.max_bins = max_bins
         self.margin_depth_decay = margin_depth_decay
         self.min_train_weight_fraction = min_train_weight_fraction
         self.prebin_numeric = prebin_numeric
+        self.margin_cv_folds = margin_cv_folds
+        self.margin_cv_repeats = margin_cv_repeats
 
     # ------------------------------------------------------------------
     # Sklearn interface helpers
@@ -190,10 +223,15 @@ class FuzzyDTree:
             "max_cat_threshold": self.max_cat_threshold,
             "random_state": self.random_state,
             "margin_grid_size": self.margin_grid_size,
+            "margin_min_scale": self.margin_min_scale,
+            "margin_max_scale": self.margin_max_scale,
+            "include_hard_splits": self.include_hard_splits,
             "max_bins": self.max_bins,
             "margin_depth_decay": self.margin_depth_decay,
             "min_train_weight_fraction": self.min_train_weight_fraction,
             "prebin_numeric": self.prebin_numeric,
+            "margin_cv_folds": self.margin_cv_folds,
+            "margin_cv_repeats": self.margin_cv_repeats,
         }
 
     def set_params(self, **params):
@@ -277,6 +315,23 @@ class FuzzyDTree:
                             candidates, margins, min_samples_leaf, nan_mu):
         raise NotImplementedError
 
+    def _child_pred(self, y, w):
+        """Prediction representation for a (fuzzy-weighted) child.
+
+        Used only by margin cross-validation. Return ``None`` when the child
+        has effectively no weight. Regression returns a scalar mean;
+        classification returns a class-probability vector.
+        """
+        raise NotImplementedError
+
+    def _blend_loss(self, y_val, w_val, mu_val, left_pred, right_pred):
+        """Total weighted validation loss of the fuzzy two-child blend.
+
+        ``pred = mu_val * left_pred + (1 - mu_val) * right_pred`` per sample.
+        Used only by margin cross-validation.
+        """
+        raise NotImplementedError
+
     def _post_fit(self, X, y, w):
         """Hook called at the end of fit() with encoded X, prepared y, weights."""
         pass
@@ -289,13 +344,99 @@ class FuzzyDTree:
     # Split finding
     # ------------------------------------------------------------------
 
+    def _validate_tree_params(self):
+        if int(self.margin_grid_size) < 1:
+            raise ValueError("margin_grid_size must be at least 1")
+        if float(self.margin_min_scale) <= 0:
+            raise ValueError("margin_min_scale must be positive")
+        if float(self.margin_max_scale) <= 0:
+            raise ValueError("margin_max_scale must be positive")
+        if float(self.margin_depth_decay) <= 0:
+            raise ValueError("margin_depth_decay must be positive")
+        if float(self.min_train_weight_fraction) < 0:
+            raise ValueError("min_train_weight_fraction must be non-negative")
+        if int(self.margin_cv_folds) not in (0,) and int(self.margin_cv_folds) < 2:
+            raise ValueError("margin_cv_folds must be 0 (off) or >= 2")
+        if int(self.margin_cv_repeats) < 1:
+            raise ValueError("margin_cv_repeats must be at least 1")
+
     def _margin_candidates(self, feat_std, depth=0):
+        margins = []
+        if self.include_hard_splits:
+            margins.append(0.0)
+
         if feat_std < 1e-12:
-            return np.array([1e-12])
-        lo = feat_std * 0.4
-        hi = feat_std * 20.0 * (self.margin_depth_decay ** depth)
+            margins.append(1e-12)
+            return np.unique(np.asarray(margins, dtype=np.float64))
+
+        lo = max(feat_std * float(self.margin_min_scale), 1e-12)
+        hi = feat_std * float(self.margin_max_scale)
+        hi *= float(self.margin_depth_decay) ** depth
         hi = max(hi, lo)
-        return np.geomspace(lo, hi, self.margin_grid_size)
+        margins.extend(np.geomspace(lo, hi, int(self.margin_grid_size)))
+        return np.unique(np.asarray(margins, dtype=np.float64))
+
+    def _cv_select_margin(self, col, y, w, threshold, nan_go_left, margins):
+        """Pick the margin minimising k-fold CV loss for a fixed split.
+
+        ``col`` is the (node-local) feature column, ``threshold`` and
+        ``nan_go_left`` the already-chosen split geometry. The feature/threshold
+        are held fixed; only the margin is cross-validated over ``margins``
+        (which includes the hard ``margin=0`` candidate). With
+        ``margin_cv_repeats > 1`` the out-of-fold loss is averaged over that
+        many independent partitions to damp seed-to-seed jitter. Returns the
+        winning margin, or ``None`` when there is too little data to
+        cross-validate.
+        """
+        folds = int(self.margin_cv_folds)
+        repeats = max(1, int(self.margin_cv_repeats))
+        margins = np.unique(np.asarray(margins, dtype=np.float64))
+        n = len(y)
+        if folds < 2 or margins.size <= 1 or n < 2 * folds:
+            return None
+
+        nan_mask = np.isnan(col)
+        nan_fill = 1.0 if nan_go_left else 0.0
+
+        # Membership per margin is fold-independent — precompute once.
+        mu_all = np.empty((margins.size, n), dtype=np.float64)
+        for mi, m in enumerate(margins):
+            mu = self._membership_left(col, threshold, m)
+            if nan_mask.any():
+                mu = np.where(nan_mask, nan_fill, mu)
+            mu_all[mi] = mu
+
+        losses = np.zeros(margins.size, dtype=np.float64)
+        valid = np.ones(margins.size, dtype=bool)
+
+        # Accumulate out-of-fold loss across `repeats` independent k-fold
+        # partitions. Summing (rather than averaging) is fine — the argmin is
+        # scale-invariant — and the extra partitions shrink the variance of
+        # which margin wins, so the tree stops swinging with random_state.
+        for _ in range(repeats):
+            fold_ids = self._cv_rng.permutation(n) % folds
+            for k in range(folds):
+                val = fold_ids == k
+                tr = ~val
+                if not val.any() or not tr.any():
+                    continue
+                y_tr, w_tr, y_val, w_val = y[tr], w[tr], y[val], w[val]
+                for mi in range(margins.size):
+                    if not valid[mi]:
+                        continue
+                    mu_tr = mu_all[mi][tr]
+                    left = self._child_pred(y_tr, w_tr * mu_tr)
+                    right = self._child_pred(y_tr, w_tr * (1.0 - mu_tr))
+                    if left is None or right is None:
+                        valid[mi] = False
+                        continue
+                    losses[mi] += self._blend_loss(
+                        y_val, w_val, mu_all[mi][val], left, right)
+
+        losses[~valid] = np.inf
+        if not np.isfinite(losses).any():
+            return None
+        return float(margins[int(np.argmin(losses))])
 
     def _bin_candidates(self, uniq):
         midpoints = 0.5 * (uniq[:-1] + uniq[1:])
@@ -423,6 +564,18 @@ class FuzzyDTree:
                     best_nan_go_left = (nan_mu == 1.0)
                     best_is_cat = False
                     best_cats_left = None
+
+        if (best_feat is not None and not best_is_cat
+                and int(self.margin_cv_folds) >= 2):
+            col = X[:, best_feat]
+            valid = ~np.isnan(col)
+            feat_std = (self._wstd(col[valid], w[valid])
+                        if valid.any() else 0.0)
+            cv_margin = self._cv_select_margin(
+                col, y, w, best_thresh, best_nan_go_left,
+                self._margin_candidates(feat_std, depth))
+            if cv_margin is not None:
+                best_margin = cv_margin
 
         return (best_feat, best_thresh, best_margin,
                 best_imp,
@@ -779,6 +932,7 @@ class FuzzyDTree:
         return X_out
 
     def fit(self, X, y, sample_weight=None):
+        self._validate_tree_params()
         self._fast_numeric_arrays_ = None
         X_raw = X
 
@@ -804,6 +958,12 @@ class FuzzyDTree:
 
         self.n_features_in_ = X.shape[1]
         self._rng = np.random.RandomState(self.random_state)
+        # Margin cross-validation must not make a single tree non-deterministic.
+        # Give the CV fold shuffle its own RNG, seeded deterministically when no
+        # random_state is set, so default fits are reproducible (and decoupled
+        # from how many CV calls happen to advance the main _rng).
+        self._cv_rng = np.random.RandomState(
+            0 if self.random_state is None else self.random_state)
         X_bins, self._bin_thresholds_, self._bin_centers_ = \
             self._prebin_numeric_features(X)
 
@@ -880,6 +1040,71 @@ class FuzzyDTree:
             stack.append((node.left, weights * mu_l))
 
         return leaf_values, leaf_weights
+
+    def _leaf_slices_by_node(self):
+        """Map each node to its contiguous leaf range in leaf-weight order."""
+        slices = {}
+        leaves = []
+
+        def visit(node):
+            start = len(leaves)
+            if node.is_leaf:
+                leaves.append(node)
+            else:
+                visit(node.left)
+                visit(node.right)
+            slices[id(node)] = (start, len(leaves))
+
+        visit(self.tree_)
+        return slices
+
+    def _node_mu_left(self, X, node, threshold=None, margin=None):
+        """Return left membership for a node, optionally with trial params."""
+        if node.is_leaf:
+            raise ValueError("Leaf nodes do not have memberships")
+        if threshold is None:
+            threshold = node.threshold
+        if margin is None:
+            margin = node.margin
+        return self._compute_mu_left(
+            X[:, node.feature], node.feature, threshold, margin,
+            node.is_categorical, node.categories_left, node.nan_go_left)
+
+    def _node_prefix_weights(self, X):
+        """Return sample weights reaching each node before that node's split."""
+        n = X.shape[0]
+        prefixes = {}
+        stack = [(self.tree_, np.ones(n, dtype=np.float64))]
+        while stack:
+            node, weights = stack.pop()
+            prefixes[id(node)] = weights
+            if node.is_leaf:
+                continue
+            mu_l = self._node_mu_left(X, node)
+            stack.append((node.right, weights * (1.0 - mu_l)))
+            stack.append((node.left, weights * mu_l))
+        return prefixes
+
+    def _collect_subtree_leaf_weights(self, X, root):
+        """Compute leaf weights inside a subtree, starting from weight 1."""
+        n = X.shape[0]
+        n_leaves = self._count_leaves(root)
+        leaf_weights = np.empty((n, n_leaves), dtype=np.float64)
+        leaf_col = [0]
+
+        stack = [(root, np.ones(n, dtype=np.float64))]
+        while stack:
+            node, weights = stack.pop()
+            if node.is_leaf:
+                leaf_weights[:, leaf_col[0]] = weights
+                leaf_col[0] += 1
+                continue
+
+            mu_l = self._node_mu_left(X, node)
+            stack.append((node.right, weights * (1.0 - mu_l)))
+            stack.append((node.left, weights * mu_l))
+
+        return leaf_weights
 
     def _leaf_nodes_in_weight_order(self):
         """Return leaves in the same DFS order as _collect_all_leaf_weights."""

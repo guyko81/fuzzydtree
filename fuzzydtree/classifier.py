@@ -239,6 +239,17 @@ class FuzzyTreeClassifier(FuzzyDTree):
         Initial line-search step size for ``leaf_prediction='logit_ce'``.
     leaf_logit_ce_tol : float, default=1e-6
         Relative improvement tolerance for ``leaf_prediction='logit_ce'``.
+    optimize_leaf_values : bool, default=False
+        If True, jointly re-fit the leaf log-odds after building (and after any
+        split refinement). Maps a ``frequency`` leaf model up to ``logit_mse``;
+        if ``leaf_prediction`` is already a logit mode it is honoured as-is.
+    refine_splits : bool, default=False
+        After tree construction, greedily refine numeric thresholds and margins
+        against weighted log-loss while keeping the tree topology fixed.
+    refine_splits_max_iter : int, default=1
+        Number of coordinate-refinement passes over internal numeric nodes.
+    refine_splits_candidates : int, default=4
+        Number of threshold and margin candidates tried around each split.
 
     All other parameters are inherited from FuzzyDTree.
     """
@@ -246,7 +257,10 @@ class FuzzyTreeClassifier(FuzzyDTree):
     def __init__(self, *, split_criterion="logit_mse",
                  leaf_prediction="frequency", leaf_logit_l2=1e-2,
                  leaf_logit_target=4.0, leaf_logit_ce_max_iter=100,
-                 leaf_logit_ce_lr=1.0, leaf_logit_ce_tol=1e-6, **kwargs):
+                 leaf_logit_ce_lr=1.0, leaf_logit_ce_tol=1e-6,
+                 optimize_leaf_values=False, refine_splits=False,
+                 refine_splits_max_iter=1, refine_splits_candidates=4,
+                 **kwargs):
         super().__init__(**kwargs)
         self.split_criterion = split_criterion
         self.leaf_prediction = leaf_prediction
@@ -255,6 +269,10 @@ class FuzzyTreeClassifier(FuzzyDTree):
         self.leaf_logit_ce_max_iter = leaf_logit_ce_max_iter
         self.leaf_logit_ce_lr = leaf_logit_ce_lr
         self.leaf_logit_ce_tol = leaf_logit_ce_tol
+        self.optimize_leaf_values = optimize_leaf_values
+        self.refine_splits = refine_splits
+        self.refine_splits_max_iter = refine_splits_max_iter
+        self.refine_splits_candidates = refine_splits_candidates
 
     def get_params(self, deep=True):
         params = super().get_params(deep=deep)
@@ -265,6 +283,10 @@ class FuzzyTreeClassifier(FuzzyDTree):
         params["leaf_logit_ce_max_iter"] = self.leaf_logit_ce_max_iter
         params["leaf_logit_ce_lr"] = self.leaf_logit_ce_lr
         params["leaf_logit_ce_tol"] = self.leaf_logit_ce_tol
+        params["optimize_leaf_values"] = self.optimize_leaf_values
+        params["refine_splits"] = self.refine_splits
+        params["refine_splits_max_iter"] = self.refine_splits_max_iter
+        params["refine_splits_candidates"] = self.refine_splits_candidates
         return params
 
     # ------------------------------------------------------------------
@@ -292,6 +314,24 @@ class FuzzyTreeClassifier(FuzzyDTree):
                 best_weight = cw
                 best_class = c
         return float(best_class)
+
+    def _child_pred(self, y, w):
+        """Fuzzy-weighted class-probability vector for a child."""
+        s = w.sum()
+        if s < 1e-12:
+            return None
+        p = np.zeros(self.n_classes_, dtype=np.float64)
+        np.add.at(p, y.astype(np.intp), w)
+        return p / s
+
+    @staticmethod
+    def _blend_loss(y_val, w_val, mu_val, left_pred, right_pred):
+        """Weighted multiclass log-loss of the blended class probabilities."""
+        prob = (mu_val[:, None] * left_pred[None, :]
+                + (1.0 - mu_val)[:, None] * right_pred[None, :])
+        true_p = prob[np.arange(len(y_val)), y_val.astype(np.intp)]
+        true_p = np.clip(true_p, 1e-12, 1.0)
+        return float(-(w_val @ np.log(true_p)))
 
     @staticmethod
     def _compute_gini_impurity(y, w, n_classes=None):
@@ -326,6 +366,10 @@ class FuzzyTreeClassifier(FuzzyDTree):
             raise ValueError("leaf_logit_ce_lr must be positive")
         if self.leaf_logit_ce_tol < 0:
             raise ValueError("leaf_logit_ce_tol must be non-negative")
+        if self.refine_splits_max_iter < 0:
+            raise ValueError("refine_splits_max_iter must be non-negative")
+        if self.refine_splits_candidates < 2:
+            raise ValueError("refine_splits_candidates must be at least 2")
 
     def _compute_impurity(self, y, w):
         if self.split_criterion in ("logit_mse", "gini"):
@@ -359,21 +403,43 @@ class FuzzyTreeClassifier(FuzzyDTree):
             min_samples_leaf, nan_mu, self.n_classes_)
 
     def _post_fit(self, X, y, w):
-        """Compute per-leaf class probability distributions."""
+        """Fit per-leaf distributions, then optionally refine the splits."""
+        leaf_weights = self._fit_leaf_distributions(
+            X, y, w, compute_node_probs=not self.refine_splits)
+        if self.refine_splits:
+            self._refine_splits(X, y, w, leaf_weights=leaf_weights)
+            self._fit_node_class_probs(X, y, w)
+
+    def _fit_leaf_distributions(self, X, y, w, compute_node_probs=True):
+        """Compute per-leaf class probabilities (and optimised leaf logits)."""
         _, leaf_weights = self._collect_all_leaf_weights(X)
         n_leaves = leaf_weights.shape[1]
-        self.leaf_probs_ = np.zeros((n_leaves, self.n_classes_),
-                                    dtype=np.float64)
-        for j in range(n_leaves):
-            wj = w * leaf_weights[:, j]
-            for c in range(self.n_classes_):
-                self.leaf_probs_[j, c] = wj[y == c].sum()
-            row_sum = self.leaf_probs_[j].sum()
-            if row_sum > 1e-15:
-                self.leaf_probs_[j] /= row_sum
-            else:
-                self.leaf_probs_[j] = 1.0 / self.n_classes_
+        y_int = y.astype(np.int64)
+        class_weights = np.zeros((len(y_int), self.n_classes_),
+                                 dtype=np.float64)
+        class_weights[np.arange(len(y_int)), y_int] = w
+        self.leaf_probs_ = leaf_weights.T @ class_weights
+        row_sums = self.leaf_probs_.sum(axis=1, keepdims=True)
+        self.leaf_probs_ = self.leaf_probs_ / np.where(
+            row_sums > 1e-15, row_sums, 1.0)
+        empty = (row_sums[:, 0] <= 1e-15)
+        if empty.any():
+            self.leaf_probs_[empty] = 1.0 / self.n_classes_
 
+        self.leaf_logits_ = None
+        mode = self.leaf_prediction
+        if self.optimize_leaf_values and mode == "frequency":
+            mode = "logit_mse"   # optimize_leaf_values turns on the logit refit
+        if mode == "logit_mse":
+            self._optimize_leaf_logits(leaf_weights, y, w)
+        elif mode == "logit_ce":
+            self._optimize_leaf_logits_ce(leaf_weights, y, w)
+
+        if compute_node_probs:
+            self._fit_node_class_probs(X, y, w)
+        return leaf_weights
+
+    def _fit_node_class_probs(self, X, y, w):
         self._leaf_prob_by_node_id_ = {
             id(node): prob.copy()
             for node, prob in zip(self._leaf_nodes_in_weight_order(),
@@ -381,12 +447,6 @@ class FuzzyTreeClassifier(FuzzyDTree):
         }
         self._node_class_probs_ = {}
         self._compute_node_class_probs(self.tree_, X, y, w)
-
-        self.leaf_logits_ = None
-        if self.leaf_prediction == "logit_mse":
-            self._optimize_leaf_logits(leaf_weights, y, w)
-        elif self.leaf_prediction == "logit_ce":
-            self._optimize_leaf_logits_ce(leaf_weights, y, w)
 
     def fit(self, X, y, sample_weight=None):
         self._validate_classifier_params()
@@ -413,9 +473,10 @@ class FuzzyTreeClassifier(FuzzyDTree):
         wl = w * mu_l
         wr = w * (1.0 - mu_l)
 
-        eps = 1e-6 * w.max() if w.max() > 0 else 1e-10
+        wmax = w.max() if w.size else 0.0
+        eps = 1e-6 * wmax if wmax > 0 else 1e-10
         if self.min_train_weight_fraction > 0:
-            eps = max(eps, self.min_train_weight_fraction * w.max())
+            eps = max(eps, self.min_train_weight_fraction * wmax)
         lm = wl > eps
         rm = wr > eps
 
@@ -514,6 +575,163 @@ class FuzzyTreeClassifier(FuzzyDTree):
         exp_scores = np.exp(scores)
         sums = exp_scores.sum(axis=1, keepdims=True)
         return exp_scores / np.where(sums > 1e-15, sums, 1.0)
+
+    # ------------------------------------------------------------------
+    # Fixed-topology split refinement (against weighted log-loss)
+    # ------------------------------------------------------------------
+
+    def _internal_numeric_nodes(self):
+        nodes = []
+        stack = [self.tree_]
+        while stack:
+            node = stack.pop()
+            if node.is_leaf:
+                continue
+            if not node.is_categorical:
+                nodes.append(node)
+            stack.append(node.right)
+            stack.append(node.left)
+        return nodes
+
+    def _candidate_thresholds(self, values, current, n_candidates):
+        valid = np.sort(np.unique(values[np.isfinite(values)]))
+        if valid.size < 2:
+            return np.array([current], dtype=np.float64)
+        idx = np.searchsorted(valid, current)
+        lo = max(0, idx - n_candidates)
+        hi = min(valid.size - 1, idx + n_candidates)
+        local = valid[lo:hi + 1]
+        mids = 0.5 * (local[:-1] + local[1:])
+        if mids.size == 0:
+            return np.array([current], dtype=np.float64)
+        order = np.argsort(np.abs(mids - current))
+        keep = order[:n_candidates]
+        return np.unique(np.r_[current, mids[keep]]).astype(np.float64)
+
+    def _candidate_margins(self, current, n_candidates):
+        if current <= 1e-12:
+            return np.array([current], dtype=np.float64)
+        multipliers = np.geomspace(0.25, 4.0, n_candidates)
+        return np.unique(np.r_[current, current * multipliers]).astype(
+            np.float64)
+
+    def _weighted_logloss_from_raw(self, raw, y, w, use_logits):
+        if use_logits:
+            probs = self._softmax(raw)
+        else:
+            row = raw.sum(axis=1, keepdims=True)
+            probs = raw / np.where(row > 1e-15, row, 1.0)
+        y_int = y.astype(np.int64)
+        p_true = np.clip(probs[np.arange(len(y_int)), y_int], 1e-15, 1.0)
+        s = w.sum()
+        return float(-(w @ np.log(p_true)) / s) if s > 1e-15 else 0.0
+
+    def _weighted_logloss(self, X, y, w):
+        _, leaf_weights = self._collect_all_leaf_weights(X)
+        use_logits = getattr(self, "leaf_logits_", None) is not None
+        leaf_values = self.leaf_logits_ if use_logits else self.leaf_probs_
+        return self._weighted_logloss_from_raw(
+            leaf_weights @ leaf_values, y, w, use_logits)
+
+    def _split_refinement_cache(self, X, leaf_weights=None):
+        if leaf_weights is None:
+            _, leaf_weights = self._collect_all_leaf_weights(X)
+        use_logits = getattr(self, "leaf_logits_", None) is not None
+        leaf_values = self.leaf_logits_ if use_logits else self.leaf_probs_
+
+        return {
+            "leaf_weights": leaf_weights,
+            "leaf_values": leaf_values,
+            "leaf_slices": self._leaf_slices_by_node(),
+            "base_raw": leaf_weights @ leaf_values,
+            "prefixes": self._node_prefix_weights(X),
+            "use_logits": use_logits,
+        }
+
+    def _split_refinement_context(self, cache, X, node):
+        leaf_values = cache["leaf_values"]
+        leaf_slices = cache["leaf_slices"]
+
+        start, stop = leaf_slices[id(node)]
+        old_node_raw = (
+            cache["leaf_weights"][:, start:stop] @ leaf_values[start:stop])
+
+        left_start, left_stop = leaf_slices[id(node.left)]
+        right_start, right_stop = leaf_slices[id(node.right)]
+        left_weights = self._collect_subtree_leaf_weights(X, node.left)
+        right_weights = self._collect_subtree_leaf_weights(X, node.right)
+
+        return {
+            "base_raw": cache["base_raw"],
+            "old_node_raw": old_node_raw,
+            "left_raw": left_weights @ leaf_values[left_start:left_stop],
+            "right_raw": right_weights @ leaf_values[right_start:right_stop],
+            "prefix": cache["prefixes"][id(node)],
+            "use_logits": cache["use_logits"],
+        }
+
+    def _candidate_refinement_logloss(self, context, X, y, w, node,
+                                      threshold, margin):
+        mu_l = self._node_mu_left(X, node, threshold, margin)
+        prefix = context["prefix"][:, None]
+        new_node_raw = prefix * (
+            mu_l[:, None] * context["left_raw"]
+            + (1.0 - mu_l)[:, None] * context["right_raw"])
+        raw = context["base_raw"] - context["old_node_raw"] + new_node_raw
+        return self._weighted_logloss_from_raw(
+            raw, y, w, context["use_logits"])
+
+    def _refine_splits(self, X, y, w, leaf_weights=None):
+        max_iter = int(self.refine_splits_max_iter)
+        if max_iter <= 0:
+            return
+        n_candidates = int(self.refine_splits_candidates)
+        for _ in range(max_iter):
+            improved = False
+            cache = None
+            for node in self._internal_numeric_nodes():
+                old_threshold = node.threshold
+                old_margin = node.margin
+                best_threshold = old_threshold
+                best_margin = old_margin
+                if cache is None:
+                    cache = self._split_refinement_cache(
+                        X, leaf_weights=leaf_weights)
+                    leaf_weights = None
+                context = self._split_refinement_context(cache, X, node)
+                best_loss = self._weighted_logloss_from_raw(
+                    context["base_raw"], y, w, context["use_logits"])
+                node_improved = False
+
+                thresholds = self._candidate_thresholds(
+                    X[:, node.feature], old_threshold, n_candidates)
+                if int(self.margin_cv_folds) >= 2:
+                    # Keep the cross-validated margin; only refine thresholds.
+                    margins = np.array([old_margin], dtype=np.float64)
+                else:
+                    margins = self._candidate_margins(old_margin, n_candidates)
+
+                for threshold in thresholds:
+                    for m in margins:
+                        loss = self._candidate_refinement_logloss(
+                            context, X, y, w, node, float(threshold),
+                            float(m))
+                        if loss + 1e-12 < best_loss:
+                            best_loss = loss
+                            best_threshold = float(threshold)
+                            best_margin = float(m)
+                            node_improved = True
+
+                if node_improved:
+                    node.threshold = best_threshold
+                    node.margin = best_margin
+                    leaf_weights = self._fit_leaf_distributions(
+                        X, y, w, compute_node_probs=False)
+                    cache = None
+                    improved = True
+
+            if not improved:
+                break
 
     # ------------------------------------------------------------------
     # Predict

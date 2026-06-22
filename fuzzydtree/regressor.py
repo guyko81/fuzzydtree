@@ -187,9 +187,9 @@ class FuzzyTreeRegressor(FuzzyDTree):
     """
 
     def __init__(self, *, optimize_split_gain=False,
-                 optimize_leaf_values=True, leaf_l2=1e-1,
+                 optimize_leaf_values=False, leaf_l2=1e-1,
                  leaf_l2_mode="centered", split_gain_l2=0.0,
-                 refine_splits=True, refine_splits_max_iter=1,
+                 refine_splits=False, refine_splits_max_iter=1,
                  refine_splits_candidates=4, **kwargs):
         super().__init__(**kwargs)
         self.optimize_split_gain = optimize_split_gain
@@ -229,6 +229,18 @@ class FuzzyTreeRegressor(FuzzyDTree):
             return 0.0
         mean = (w @ y) / s
         return (w @ ((y - mean) ** 2)) / s
+
+    @staticmethod
+    def _child_pred(y, w):
+        s = w.sum()
+        if s < 1e-12:
+            return None
+        return (w @ y) / s
+
+    @staticmethod
+    def _blend_loss(y_val, w_val, mu_val, left_pred, right_pred):
+        pred = mu_val * left_pred + (1.0 - mu_val) * right_pred
+        return float(w_val @ ((y_val - pred) ** 2))
 
     def _eval_numeric_split(self, y, w, bin_assign, bin_centers,
                             candidates, margins, min_samples_leaf, nan_mu):
@@ -274,6 +286,15 @@ class FuzzyTreeRegressor(FuzzyDTree):
 
     def _try_build_c_depth_first(self, X, y, w, X_bins):
         if _c_backend is None:
+            return None
+        if int(self.margin_cv_folds) >= 2:
+            # Margins are chosen by CV in the Python grower; the compiled
+            # path selects them on training impurity and would bypass it.
+            return None
+        if (self.include_hard_splits
+                or float(self.margin_min_scale) != 0.4
+                or float(self.margin_max_scale) != 20.0):
+            # The compiled grower still has the legacy margin grid baked in.
             return None
         if X_bins is None or self.max_leaves is not None:
             return None
@@ -500,7 +521,11 @@ class FuzzyTreeRegressor(FuzzyDTree):
 
                 thresholds = self._candidate_thresholds(
                     X[:, node.feature], old_threshold, n_candidates)
-                margins = self._candidate_margins(old_margin, n_candidates)
+                if int(self.margin_cv_folds) >= 2:
+                    # Keep the cross-validated margin; only refine thresholds.
+                    margins = np.array([old_margin], dtype=np.float64)
+                else:
+                    margins = self._candidate_margins(old_margin, n_candidates)
 
                 for threshold in thresholds:
                     for m in margins:
