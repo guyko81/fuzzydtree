@@ -126,6 +126,55 @@ def test_regressor_reproducibility():
     print("  PASSED\n")
 
 
+def test_default_fit_is_deterministic():
+    """Default fits (random_state=None, margin CV on) must be reproducible.
+
+    Margin cross-validation shuffles fold assignments; that shuffle must not
+    leak OS entropy into a single tree, or repeated default fits diverge.
+    """
+    rng = np.random.RandomState(0)
+    X = rng.randn(300, 4)
+    y = X[:, 0] + 0.5 * X[:, 1] ** 2 + rng.randn(300) * 0.2
+    yc = (y > np.median(y)).astype(int)
+
+    assert FuzzyTreeRegressor().get_params()["margin_cv_folds"] >= 2
+    for Model, target in [(FuzzyTreeRegressor, y), (FuzzyTreeClassifier, yc)]:
+        a = Model(max_depth=8, min_samples_leaf=5).fit(X, target).predict(X)
+        b = Model(max_depth=8, min_samples_leaf=5).fit(X, target).predict(X)
+        np.testing.assert_allclose(
+            a, b, err_msg=f"{Model.__name__} default fit is non-deterministic")
+    print("  default (random_state=None) fits are deterministic")
+    print("  PASSED\n")
+
+
+def test_margin_cv_repeats():
+    """Repeated margin CV must validate, round-trip, and stay deterministic."""
+    assert FuzzyTreeRegressor().get_params()["margin_cv_repeats"] >= 1
+    assert FuzzyTreeRegressor(
+        margin_cv_repeats=4).get_params()["margin_cv_repeats"] == 4
+
+    for bad in (0, -1):
+        try:
+            FuzzyTreeRegressor(margin_cv_repeats=bad).fit(
+                np.zeros((20, 2)), np.zeros(20))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"margin_cv_repeats={bad} should raise ValueError")
+
+    rng = np.random.RandomState(0)
+    X = rng.randn(300, 4)
+    y = X[:, 0] + 0.5 * X[:, 1] ** 2 + rng.randn(300) * 0.2
+    a = FuzzyTreeRegressor(max_depth=8, min_samples_leaf=5,
+                           margin_cv_repeats=3).fit(X, y).predict(X)
+    b = FuzzyTreeRegressor(max_depth=8, min_samples_leaf=5,
+                           margin_cv_repeats=3).fit(X, y).predict(X)
+    np.testing.assert_allclose(a, b)
+    print("  repeated margin CV validates, round-trips, deterministic")
+    print("  PASSED\n")
+
+
 def test_regressor_missing_values():
     """Missing values in numeric features should be handled."""
     rng = np.random.RandomState(42)
@@ -161,31 +210,33 @@ def test_regressor_categorical():
     print("  PASSED\n")
 
 
-def test_regressor_new_params_validation():
-    """New regressor optimisation parameters should validate and round-trip."""
+def test_regressor_post_training_params():
+    """Post-training leaf/split optimisation params validate and round-trip."""
     defaults = FuzzyTreeRegressor().get_params()
+    assert defaults["optimize_leaf_values"] is False
+    assert defaults["optimize_split_gain"] is False
     assert defaults["leaf_l2"] == 0.1
     assert defaults["leaf_l2_mode"] == "centered"
-    assert defaults["refine_splits"] is True
+    assert defaults["refine_splits"] is False
     assert defaults["refine_splits_candidates"] == 4
 
     ft = FuzzyTreeRegressor(
-        optimize_split_gain=True,
-        leaf_l2=0.2,
-        leaf_l2_mode="zero",
-        split_gain_l2="leaf_l2",
-        refine_splits=True,
-        refine_splits_max_iter=2,
-        refine_splits_candidates=3,
-    )
+        optimize_split_gain=True, optimize_leaf_values=True, leaf_l2=0.2,
+        leaf_l2_mode="zero", split_gain_l2="leaf_l2", refine_splits=True,
+        refine_splits_max_iter=2, refine_splits_candidates=3)
     params = ft.get_params()
-    assert params["optimize_split_gain"] is True
+    assert params["optimize_leaf_values"] is True
     assert params["leaf_l2"] == 0.2
     assert params["leaf_l2_mode"] == "zero"
-    assert params["split_gain_l2"] == "leaf_l2"
     assert params["refine_splits"] is True
     assert params["refine_splits_max_iter"] == 2
-    assert params["refine_splits_candidates"] == 3
+
+    # The optimisations actually run end-to-end.
+    rng = np.random.RandomState(0)
+    X = rng.randn(200, 3)
+    y = X[:, 0] + 0.5 * X[:, 1] ** 2 + rng.randn(200) * 0.2
+    FuzzyTreeRegressor(max_depth=5, margin_cv_folds=0, optimize_leaf_values=True,
+                       refine_splits=True, random_state=0).fit(X, y)
 
     bad = FuzzyTreeRegressor(leaf_l2_mode="bad-mode")
     try:
@@ -194,7 +245,6 @@ def test_regressor_new_params_validation():
         pass
     else:
         raise AssertionError("invalid leaf_l2_mode should raise ValueError")
-
     print("  PASSED\n")
 
 
@@ -208,7 +258,6 @@ def test_fast_numeric_prediction_matches_leaf_weights():
         max_depth=4,
         min_samples_leaf=5,
         random_state=0,
-        refine_splits=False,
     )
     ft.fit(X, y)
 
@@ -288,6 +337,7 @@ def test_c_depth_first_grower_matches_python_builder():
         margin_min_scale=0.4,
         margin_max_scale=20.0,
         include_hard_splits=False,
+        margin_cv_folds=0,   # CV off so the compiled depth-first grower is used
         random_state=0,
         optimize_split_gain=True,
         optimize_leaf_values=False,
@@ -585,6 +635,181 @@ def test_classifier_log_odds_explanation():
     print("  PASSED\n")
 
 
+def test_lookahead_split_selection():
+    """Forward-looking lookahead build: validates, deterministic, helps vs greedy."""
+    # smooth target where hard greedy splits hurt and lookahead should recover.
+    def hill(X):
+        x, y = X[:, 0], X[:, 1]
+        return np.exp(-((x - 0.5) ** 2 + (y + 0.3) ** 2)) + 0.3 * x - 0.2 * y
+    rng = np.random.RandomState(0)
+    X = rng.uniform(-2, 2, size=(150, 2))
+    z = hill(X) + rng.normal(0, 0.05, 150)
+    Xte = rng.uniform(-2, 2, size=(2000, 2))
+    zte = hill(Xte)
+
+    p = FuzzyTreeRegressor().get_params()
+    assert p["lookahead_horizon"] == 0          # off by default
+    for bad in (dict(lookahead_horizon=-1), dict(lookahead_candidates=0),
+                dict(lookahead_val_fraction=0.0)):
+        try:
+            FuzzyTreeRegressor(**bad).fit(X, z)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{bad} should raise ValueError")
+
+    common = dict(max_depth=6, min_samples_leaf=1, margin_cv_folds=0,
+                  random_state=0)
+    greedy = FuzzyTreeRegressor(**common).fit(X, z)
+    look_a = FuzzyTreeRegressor(lookahead_horizon=2, **common).fit(X, z)
+    look_b = FuzzyTreeRegressor(lookahead_horizon=2, **common).fit(X, z)
+    np.testing.assert_allclose(look_a.predict(Xte), look_b.predict(Xte))
+    assert look_a.score(Xte, zte) >= greedy.score(Xte, zte) - 1e-9
+
+    # classifier path: valid probabilities + label round-trip.
+    yc = (z > np.median(z)).astype(int)
+    clf = FuzzyTreeClassifier(lookahead_horizon=1, max_depth=5,
+                              margin_cv_folds=0, random_state=0).fit(X, yc)
+    proba = clf.predict_proba(Xte)
+    np.testing.assert_allclose(proba.sum(axis=1), 1.0)
+    assert set(np.unique(clf.predict(Xte))).issubset({0, 1})
+    print("  lookahead build validates, deterministic, helps vs greedy")
+    print("  PASSED\n")
+
+
+def test_c_lookahead_grower_handles_margin_cv():
+    """Compiled lookahead grower should run with k-fold margin CV enabled."""
+    if _c_backend is None:
+        print("  C backend not built; skipping")
+        return
+    if (not hasattr(_c_backend, "grow_lookahead_regression")
+            or not hasattr(_c_backend, "grow_lookahead_classifier")):
+        print("  C lookahead backend unavailable; skipping")
+        return
+
+    import fuzzydtree.regressor as reg_module
+    import fuzzydtree.classifier as clf_module
+
+    class BackendProxy:
+        def __init__(self, backend):
+            self.backend = backend
+            self.regression_calls = 0
+            self.classifier_calls = 0
+
+        def __getattr__(self, name):
+            return getattr(self.backend, name)
+
+        def grow_lookahead_regression(self, *args):
+            self.regression_calls += 1
+            return self.backend.grow_lookahead_regression(*args)
+
+        def grow_lookahead_classifier(self, *args):
+            self.classifier_calls += 1
+            return self.backend.grow_lookahead_classifier(*args)
+
+    rng = np.random.RandomState(7)
+    X = rng.randn(140, 4)
+    y = np.sin(X[:, 0]) + 0.4 * X[:, 1] - 0.2 * X[:, 2] ** 2
+    yc = (y > np.median(y)).astype(int)
+    params = dict(max_depth=4, max_bins=24, min_samples_leaf=2,
+                  lookahead_horizon=2, lookahead_candidates=3,
+                  margin_grid_size=4, margin_cv_folds=3,
+                  margin_cv_repeats=2, random_state=0)
+
+    proxy = BackendProxy(_c_backend)
+    reg_backend = reg_module._c_backend
+    clf_backend = clf_module._c_backend
+    try:
+        reg_module._c_backend = proxy
+        clf_module._c_backend = proxy
+        reg = FuzzyTreeRegressor(**params).fit(X, y)
+        clf = FuzzyTreeClassifier(**params).fit(X, yc)
+    finally:
+        reg_module._c_backend = reg_backend
+        clf_module._c_backend = clf_backend
+
+    assert proxy.regression_calls >= 1
+    assert proxy.classifier_calls >= 1
+    assert np.isfinite(reg.predict(X)).all()
+    np.testing.assert_allclose(clf.predict_proba(X).sum(axis=1), 1.0)
+    print("  C lookahead grower handles margin CV")
+    print("  PASSED\n")
+
+
+def test_fuzzy_forests():
+    """Bagged fuzzy forests fit, predict, stay deterministic, and beat a tree."""
+    from fuzzydtree import FuzzyForestClassifier, FuzzyForestRegressor
+
+    rng = np.random.RandomState(0)
+    X = rng.randn(400, 5)
+    y_reg = X[:, 0] + 0.6 * X[:, 1] ** 2 + np.sin(2 * X[:, 2]) + rng.randn(400) * 0.3
+    y_cls = (y_reg > np.median(y_reg)).astype(int)
+    Xtr, Xte = X[:300], X[300:]
+
+    # Classifier: deterministic, valid probabilities, label round-trip.
+    fc = FuzzyForestClassifier(n_estimators=12, max_depth=6, min_samples_leaf=5,
+                               random_state=0).fit(Xtr, y_cls[:300])
+    fc2 = FuzzyForestClassifier(n_estimators=12, max_depth=6, min_samples_leaf=5,
+                                random_state=0).fit(Xtr, y_cls[:300])
+    proba = fc.predict_proba(Xte)
+    assert proba.shape == (100, 2)
+    np.testing.assert_allclose(proba.sum(axis=1), 1.0)
+    np.testing.assert_allclose(proba, fc2.predict_proba(Xte))
+    assert set(np.unique(fc.predict(Xte))).issubset(set(fc.classes_))
+
+    # Regressor: averaging the trees should not hurt vs a single tree.
+    fr = FuzzyForestRegressor(n_estimators=12, max_depth=8, min_samples_leaf=5,
+                              random_state=0).fit(Xtr, y_reg[:300])
+    tree = FuzzyTreeRegressor(max_depth=8, min_samples_leaf=5,
+                              random_state=0).fit(Xtr, y_reg[:300])
+    assert fr.score(Xte, y_reg[300:]) >= tree.score(Xte, y_reg[300:]) - 1e-6
+
+    # get_params flattens forest + forwarded tree params.
+    p = fr.get_params()
+    assert p["n_estimators"] == 12 and p["max_depth"] == 8
+    print("  forests OK")
+    print("  PASSED\n")
+
+
+def test_fuzzy_gradient_boosting():
+    """Fuzzy gradient boosting fits, predicts, stays deterministic, improves."""
+    from fuzzydtree import (FuzzyGradientBoostingClassifier,
+                            FuzzyGradientBoostingRegressor)
+
+    rng = np.random.RandomState(0)
+    X = rng.randn(400, 5)
+    y_reg = X[:, 0] + 0.6 * X[:, 1] ** 2 + np.sin(2 * X[:, 2]) + rng.randn(400) * 0.3
+    y_bin = (y_reg > np.median(y_reg)).astype(int)
+    y_multi = np.digitize(y_reg, np.quantile(y_reg, [0.33, 0.66]))
+    Xtr, Xte = X[:300], X[300:]
+
+    # Regression: boosting should beat its own shallow base tree.
+    gb = FuzzyGradientBoostingRegressor(n_estimators=40, learning_rate=0.1,
+                                        max_depth=2, random_state=0).fit(Xtr, y_reg[:300])
+    gb2 = FuzzyGradientBoostingRegressor(n_estimators=40, learning_rate=0.1,
+                                         max_depth=2, random_state=0).fit(Xtr, y_reg[:300])
+    np.testing.assert_allclose(gb.predict(Xte), gb2.predict(Xte))
+    base = FuzzyTreeRegressor(max_depth=2, random_state=0).fit(Xtr, y_reg[:300])
+    assert gb.score(Xte, y_reg[300:]) > base.score(Xte, y_reg[300:])
+
+    # Binary: valid probabilities + label round-trip.
+    cb = FuzzyGradientBoostingClassifier(n_estimators=40, learning_rate=0.1,
+                                         max_depth=2, random_state=0).fit(Xtr, y_bin[:300])
+    proba = cb.predict_proba(Xte)
+    assert proba.shape == (100, 2)
+    np.testing.assert_allclose(proba.sum(axis=1), 1.0)
+    assert set(np.unique(cb.predict(Xte))).issubset({0, 1})
+
+    # Multiclass: K-tree-per-round path.
+    cm = FuzzyGradientBoostingClassifier(n_estimators=25, learning_rate=0.2,
+                                         max_depth=2, random_state=0).fit(Xtr, y_multi[:300])
+    pm = cm.predict_proba(Xte)
+    assert pm.shape[1] == len(np.unique(y_multi))
+    np.testing.assert_allclose(pm.sum(axis=1), 1.0)
+    print("  gradient boosting OK")
+    print("  PASSED\n")
+
+
 if __name__ == "__main__":
     tests = [
         # Regressor
@@ -594,9 +819,11 @@ if __name__ == "__main__":
         ("Regressor: sample_weight", test_regressor_sample_weight),
         ("Regressor: feature importances", test_regressor_feature_importances),
         ("Regressor: reproducibility", test_regressor_reproducibility),
+        ("Base tree: default fit determinism", test_default_fit_is_deterministic),
+        ("Base tree: repeated margin CV", test_margin_cv_repeats),
         ("Regressor: missing values", test_regressor_missing_values),
         ("Regressor: categorical", test_regressor_categorical),
-        ("Regressor: new params validation", test_regressor_new_params_validation),
+        ("Regressor: post-training params", test_regressor_post_training_params),
         ("Regressor: fast numeric prediction", test_fast_numeric_prediction_matches_leaf_weights),
         ("Base tree: margin grid", test_margin_grid_includes_hard_and_tiny_candidates),
         ("Regressor: C MSE split backend", test_c_mse_split_backend_matches_numba),
@@ -614,6 +841,13 @@ if __name__ == "__main__":
         ("Classifier: multiclass logit-MSE leaf prediction", test_classifier_multiclass_logit_mse_leaf_prediction),
         ("Classifier: new params validation", test_classifier_new_params_validation),
         ("Classifier: log-odds explanation", test_classifier_log_odds_explanation),
+        # Lookahead
+        ("Base tree: lookahead split selection", test_lookahead_split_selection),
+        ("Base tree: C lookahead margin CV", test_c_lookahead_grower_handles_margin_cv),
+        # Forests
+        ("Forest: classifier + regressor", test_fuzzy_forests),
+        # Boosting
+        ("Boosting: classifier + regressor", test_fuzzy_gradient_boosting),
     ]
     for name, fn in tests:
         print(f"[{name}]")

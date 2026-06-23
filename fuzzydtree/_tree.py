@@ -159,16 +159,17 @@ class FuzzyDTree:
         standard deviation.
     include_hard_splits : bool, default=True
         If True, include margin=0 as an exact step-function candidate.
-    margin_cv_folds : int, default=0
+    margin_cv_folds : int, default=10
         If >= 2, choose each split's fuzzy margin by k-fold cross-validation
         instead of training-impurity reduction. The split feature and threshold
-        are still picked greedily on training impurity; then, holding them
-        fixed, the margin grid (including the hard ``margin=0`` candidate) is
-        scored by out-of-fold loss and the best margin is kept. Because a hard
+        are picked first (greedily on training impurity, or by rollout quality
+        when ``lookahead_horizon >= 1``); then, holding them fixed, the margin
+        grid (including the hard ``margin=0`` candidate) is scored by out-of-fold
+        loss and the best margin is kept. Because a hard
         boundary always wins on *training* impurity, this is the mechanism that
         lets a margin > 0 be selected only when smoothing actually generalises.
         ``0`` disables CV and restores the historical greedy behaviour.
-    margin_cv_repeats : int, default=1
+    margin_cv_repeats : int, default=3
         Number of independent k-fold partitions to average when scoring each
         split's margin grid. A single partition gives a noisy out-of-fold loss
         curve whose ``argmin`` jitters from seed to seed; averaging ``R``
@@ -176,6 +177,29 @@ class FuzzyDTree:
         making the fitted tree markedly more stable across ``random_state``
         values at ``R`` times the CV cost. Ignored when ``margin_cv_folds`` is
         ``0``.
+    lookahead_horizon : int, default=0
+        If >= 1, grow the tree with forward-looking split selection instead of
+        greedy training-impurity. At each node the top ``lookahead_candidates``
+        splits (by greedy impurity) are each rolled out into a subtree of this
+        many extra levels, and the split whose subtree generalises best on an
+        internal held-out set is committed (AlphaZero-style: choose the move by
+        the resulting position). ``0`` disables it (fast greedy build). This is
+        a numeric-only build path -- categorical features are not used as
+        lookahead candidates, and it ignores ``max_leaves``. Regressors and
+        classifiers use the compiled grower when the C backend is available;
+        unsupported cases fall back to Python. Slower than greedy; intended for
+        small/medium data. Composes with ``margin_cv_folds``: lookahead fixes
+        the split's feature/threshold by rollout quality, then (when
+        ``margin_cv_folds >= 2``) that split's margin is re-selected by k-fold
+        out-of-fold loss, the same two-stage scheme used on the greedy path.
+    lookahead_candidates : int, default=4
+        Number of shortlisted ``(feature, threshold)`` splits rolled out per
+        node when ``lookahead_horizon >= 1``.
+    lookahead_val_fraction : float, default=0.3
+        Fraction of rows held out (once, internally) to score the rollouts.
+    lookahead_min_val : float, default=5.0
+        If the held-out weight reaching a node falls below this, that node falls
+        back to a greedy split (too little signal to look ahead reliably).
     max_bins : int, default=256
     margin_depth_decay : float, default=1.0
     min_train_weight_fraction : float, default=0.01
@@ -190,7 +214,9 @@ class FuzzyDTree:
                  max_bins=256,
                  margin_depth_decay=1.0, min_train_weight_fraction=0.01,
                  prebin_numeric=True, margin_cv_folds=10,
-                 margin_cv_repeats=3):
+                 margin_cv_repeats=3, lookahead_horizon=1,
+                 lookahead_candidates=4, lookahead_val_fraction=0.3,
+                 lookahead_min_val=5.0):
         self.max_depth = max_depth
         self.max_leaves = max_leaves
         self.min_samples_leaf = min_samples_leaf
@@ -208,6 +234,10 @@ class FuzzyDTree:
         self.prebin_numeric = prebin_numeric
         self.margin_cv_folds = margin_cv_folds
         self.margin_cv_repeats = margin_cv_repeats
+        self.lookahead_horizon = lookahead_horizon
+        self.lookahead_candidates = lookahead_candidates
+        self.lookahead_val_fraction = lookahead_val_fraction
+        self.lookahead_min_val = lookahead_min_val
 
     # ------------------------------------------------------------------
     # Sklearn interface helpers
@@ -232,6 +262,10 @@ class FuzzyDTree:
             "prebin_numeric": self.prebin_numeric,
             "margin_cv_folds": self.margin_cv_folds,
             "margin_cv_repeats": self.margin_cv_repeats,
+            "lookahead_horizon": self.lookahead_horizon,
+            "lookahead_candidates": self.lookahead_candidates,
+            "lookahead_val_fraction": self.lookahead_val_fraction,
+            "lookahead_min_val": self.lookahead_min_val,
         }
 
     def set_params(self, **params):
@@ -340,6 +374,10 @@ class FuzzyDTree:
         """Optional subclass hook for compiled depth-first tree growth."""
         return None
 
+    def _try_build_c_lookahead(self, X, y, w, X_bins):
+        """Optional subclass hook for compiled lookahead tree growth."""
+        return None
+
     # ------------------------------------------------------------------
     # Split finding
     # ------------------------------------------------------------------
@@ -359,6 +397,12 @@ class FuzzyDTree:
             raise ValueError("margin_cv_folds must be 0 (off) or >= 2")
         if int(self.margin_cv_repeats) < 1:
             raise ValueError("margin_cv_repeats must be at least 1")
+        if int(self.lookahead_horizon) < 0:
+            raise ValueError("lookahead_horizon must be >= 0 (0 = off)")
+        if int(self.lookahead_candidates) < 1:
+            raise ValueError("lookahead_candidates must be at least 1")
+        if not 0.0 < float(self.lookahead_val_fraction) < 1.0:
+            raise ValueError("lookahead_val_fraction must be in (0, 1)")
 
     def _margin_candidates(self, feat_std, depth=0):
         margins = []
@@ -676,6 +720,296 @@ class FuzzyDTree:
             mu_l[nan_mask] = 1.0 if nan_go_left else 0.0
         return mu_l
 
+    # ------------------------------------------------------------------
+    # Lookahead (forward-looking, held-out-scored) split selection
+    # ------------------------------------------------------------------
+
+    def _la_leaf_value(self, y, w):
+        """Prediction object stored at a rollout leaf (subclass hook)."""
+        raise NotImplementedError
+
+    def _la_loss(self, y, w, pred):
+        """Held-out loss of a rollout subtree's prediction (subclass hook)."""
+        raise NotImplementedError
+
+    def _la_numeric_features(self):
+        return [j for j in self._feature_indices(self.n_features_in_)
+                if not self.is_categorical_[j]]
+
+    def _la_mu(self, col, threshold, margin, nan_go_left):
+        mu = self._membership_left(col, threshold, margin)
+        nan = np.isnan(col)
+        if nan.any():
+            mu = mu.copy()
+            mu[nan] = 1.0 if nan_go_left else 0.0
+        return mu
+
+    def _la_margins(self, col, w, depth):
+        valid = ~np.isnan(col)
+        feat_std = self._wstd(col[valid], w[valid]) if valid.any() else 0.0
+        return self._margin_candidates(feat_std, depth)
+
+    def _la_thresholds(self, col, w):
+        u = np.unique(col[(w > 1e-12) & ~np.isnan(col)])
+        if u.size < 2:
+            return np.empty(0, dtype=np.float64)
+        mids = 0.5 * (u[:-1] + u[1:])
+        if mids.size > int(self.max_bins):
+            idx = np.linspace(0, mids.size - 1, int(self.max_bins)).astype(int)
+            mids = mids[idx]
+        return mids
+
+    def _la_child_loss(self, y, w, wl, wr, s):
+        sl, sr = wl.sum(), wr.sum()
+        return (sl * self._compute_impurity(y, wl)
+                + sr * self._compute_impurity(y, wr)) / s
+
+    def _la_scan(self, X, y, w, depth, best_per_threshold):
+        """Greedy impurity scan over numeric splits.
+
+        If ``best_per_threshold`` is False return the single best
+        ``(feature, threshold, margin, nan_left, reduction)``; if True return a
+        list of ``(reduction, feature, threshold, nan_left)`` (best margin per
+        threshold) for shortlisting.
+        """
+        s = w.sum()
+        if s < 2 * self.min_samples_leaf:
+            return [] if best_per_threshold else None
+        parent = self._compute_impurity(y, w)
+        minw = self.min_samples_leaf
+        scored = []
+        best = None
+        best_red = 1e-12
+        for f in self._la_numeric_features():
+            col = X[:, f]
+            nan = np.isnan(col)
+            nan_left = bool(w[nan].sum() <= 0.5 * s) if nan.any() else True
+            margins = self._la_margins(col, w, depth)
+            for t in self._la_thresholds(col, w):
+                t_best = -np.inf
+                for m in margins:
+                    mu = self._la_mu(col, t, m, nan_left)
+                    wl = w * mu
+                    wr = w * (1.0 - mu)
+                    if wl.sum() < minw or wr.sum() < minw:
+                        continue
+                    red = parent - self._la_child_loss(y, w, wl, wr, s)
+                    if best_per_threshold:
+                        t_best = max(t_best, red)
+                    elif red > best_red:
+                        best_red = red
+                        best = (f, float(t), float(m), nan_left)
+                if best_per_threshold and t_best > 0:
+                    scored.append((t_best, f, float(t), nan_left))
+        if best_per_threshold:
+            scored.sort(key=lambda r: -r[0])
+            return scored[:int(self.lookahead_candidates)]
+        return best
+
+    def _la_rollout(self, X, y, w, depth, horizon):
+        node = {"leaf": True, "value": self._la_leaf_value(y, w)}
+        if depth >= horizon or w.sum() < 2 * self.min_samples_leaf:
+            return node
+        best = self._la_scan(X, y, w, depth, best_per_threshold=False)
+        if best is None:
+            return node
+        f, t, m, nl = best
+        mu = self._la_mu(X[:, f], t, m, nl)
+        wl = w * mu
+        wr = w * (1.0 - mu)
+        if wl.sum() < self.min_samples_leaf or wr.sum() < self.min_samples_leaf:
+            return node
+        return {"leaf": False, "f": f, "t": t, "m": m, "nl": nl,
+                "L": self._la_rollout(X, y, wl, depth + 1, horizon),
+                "R": self._la_rollout(X, y, wr, depth + 1, horizon)}
+
+    def _la_predict(self, sub, X):
+        out = None
+        stack = [(sub, np.ones(X.shape[0], dtype=np.float64))]
+        while stack:
+            nd, wt = stack.pop()
+            if nd["leaf"]:
+                v = nd["value"]
+                if out is None:
+                    out = np.zeros((X.shape[0],) + np.shape(v),
+                                   dtype=np.float64)
+                out += wt[:, None] * v if np.ndim(v) else wt * v
+                continue
+            mu = self._la_mu(X[:, nd["f"]], nd["t"], nd["m"], nd["nl"])
+            stack.append((nd["L"], wt * mu))
+            stack.append((nd["R"], wt * (1.0 - mu)))
+        return out
+
+    def _la_find_split(self, X, y, w, Xv, yv, wv, depth):
+        shortlist = self._la_scan(X, y, w, depth, best_per_threshold=True)
+        if not shortlist:
+            return None
+        horizon = int(self.lookahead_horizon)
+        minw = self.min_samples_leaf
+        best = None
+        best_loss = np.inf
+        for _red, f, t, nl in shortlist:
+            col = X[:, f]
+            for m in self._la_margins(col, w, depth):
+                mu = self._la_mu(col, t, m, nl)
+                wl = w * mu
+                wr = w * (1.0 - mu)
+                if wl.sum() < minw or wr.sum() < minw:
+                    continue
+                sub = {"leaf": False, "f": f, "t": t, "m": m, "nl": nl,
+                       "L": self._la_rollout(X, y, wl, 1, horizon),
+                       "R": self._la_rollout(X, y, wr, 1, horizon)}
+                loss = self._la_loss(yv, wv, self._la_predict(sub, Xv))
+                if loss < best_loss:
+                    best_loss = loss
+                    best = (f, t, m, nl)
+        return best
+
+    def _cv_select_margin_rollout(self, X, y, w, f, t, nl, depth):
+        """Pick the margin minimising k-fold CV loss of the *rollout subtree*.
+
+        Lookahead has already fixed the split feature/threshold by held-out
+        rollout quality; this re-selects only the fuzzy margin, but scores it
+        with the same forward-looking objective rather than the immediate
+        two-child split. For each margin candidate and each fold, the
+        depth-``horizon`` rollout the split would grow is built on the
+        in-fold rows and scored on the held-out rows; losses are summed over
+        ``margin_cv_repeats`` independent k-fold partitions. Returns the
+        winning margin, or ``None`` when there is too little data to
+        cross-validate.
+
+        At ``horizon == 1`` the rollout topology is just two child leaves, but
+        the fold-normalised loss still follows the lookahead validation
+        objective rather than the greedy path's direct-split loss sum.
+        """
+        folds = int(self.margin_cv_folds)
+        repeats = max(1, int(self.margin_cv_repeats))
+        n = len(y)
+        if folds < 2 or n < 2 * folds:
+            return None
+
+        col = X[:, f]
+        valid = ~np.isnan(col)
+        feat_std = self._wstd(col[valid], w[valid]) if valid.any() else 0.0
+        margins = np.unique(self._margin_candidates(feat_std, depth))
+        if margins.size <= 1:
+            return None
+
+        horizon = int(self.lookahead_horizon)
+        minw = self.min_samples_leaf
+        losses = np.zeros(margins.size, dtype=np.float64)
+        valid_m = np.ones(margins.size, dtype=bool)
+
+        for _ in range(repeats):
+            fold_ids = self._cv_rng.permutation(n) % folds
+            for k in range(folds):
+                vmask = fold_ids == k
+                tmask = ~vmask
+                if not vmask.any() or not tmask.any():
+                    continue
+                Xt, yt, wt = X[tmask], y[tmask], w[tmask]
+                Xv, yv, wv = X[vmask], y[vmask], w[vmask]
+                colt = Xt[:, f]
+                for mi in range(margins.size):
+                    if not valid_m[mi]:
+                        continue
+                    mu = self._la_mu(colt, t, float(margins[mi]), nl)
+                    wl = wt * mu
+                    wr = wt * (1.0 - mu)
+                    if wl.sum() < minw or wr.sum() < minw:
+                        valid_m[mi] = False
+                        continue
+                    sub = {"leaf": False, "f": f, "t": t,
+                           "m": float(margins[mi]), "nl": nl,
+                           "L": self._la_rollout(Xt, yt, wl, 1, horizon),
+                           "R": self._la_rollout(Xt, yt, wr, 1, horizon)}
+                    losses[mi] += self._la_loss(
+                        yv, wv, self._la_predict(sub, Xv))
+
+        losses[~valid_m] = np.inf
+        if not np.isfinite(losses).any():
+            return None
+        return float(margins[int(np.argmin(losses))])
+
+    def _build_lookahead(self, X, y, w):
+        rng = np.random.RandomState(
+            0 if self.random_state is None else self.random_state)
+        val = rng.random(X.shape[0]) < float(self.lookahead_val_fraction)
+        if val.sum() < 2 or (~val).sum() < 2:
+            return self._build_depth_first(X, y, w, 0, None)
+        root = self._la_grow(X[~val], y[~val], w[~val],
+                             X[val], y[val], w[val], 0)
+        self._la_refit_values(root, X, y, w)   # leaf values from ALL rows
+        return root
+
+    def _la_grow(self, X, y, w, Xv, yv, wv, depth):
+        eff = w.sum()
+        node = _Node(value=self._compute_leaf_value(y, w), n_samples=eff)
+        if depth >= self.max_depth or X.shape[0] < 2 or eff < 2 * self.min_samples_leaf:
+            return node
+
+        if wv.sum() < float(self.lookahead_min_val):
+            best = self._la_scan(X, y, w, depth, best_per_threshold=False)
+        else:
+            best = self._la_find_split(X, y, w, Xv, yv, wv, depth)
+        if best is None:
+            return node
+        f, t, m, nl = best
+
+        # Lookahead fixes the feature/threshold by held-out rollout score; the
+        # margin it returns is then re-selected by k-fold CV that scores the
+        # *rollout subtree* (the same forward-looking objective), so the
+        # soft-split width is chosen out-of-fold rather than on the single
+        # lookahead validation slice.
+        if int(self.margin_cv_folds) >= 2:
+            cv_margin = self._cv_select_margin_rollout(X, y, w, f, t, nl, depth)
+            if cv_margin is not None:
+                m = cv_margin
+
+        mu = self._la_mu(X[:, f], t, m, nl)
+        wl = w * mu
+        wr = w * (1.0 - mu)
+        eps = 1e-6 * w.max() if w.max() > 0 else 1e-10
+        if self.min_train_weight_fraction > 0:
+            eps = max(eps, self.min_train_weight_fraction * w.max())
+        lm = wl > eps
+        rm = wr > eps
+        if lm.sum() < 1 or rm.sum() < 1:
+            return node
+
+        muv = self._la_mu(Xv[:, f], t, m, nl)
+        wvl = wv * muv
+        wvr = wv * (1.0 - muv)
+        parent_imp = self._compute_impurity(y, w)
+        child_imp = self._la_child_loss(y, w, wl, wr, eff)
+
+        node.feature = f
+        node.threshold = t
+        node.margin = m
+        node.nan_go_left = nl
+        node.is_categorical = False
+        node.categories_left = None
+        node.impurity_reduction = (parent_imp - child_imp) * eff
+        node.left = self._la_grow(X[lm], y[lm], wl[lm], Xv, yv, wvl, depth + 1)
+        node.right = self._la_grow(X[rm], y[rm], wr[rm], Xv, yv, wvr, depth + 1)
+        return node
+
+    def _la_refit_values(self, root, X, y, w):
+        stack = [(root, w.astype(np.float64))]
+        while stack:
+            nd, wc = stack.pop()
+            if nd.is_leaf:
+                m = wc > 1e-12
+                if m.any():
+                    nd.value = self._compute_leaf_value(y[m], wc[m])
+                nd.n_samples = wc.sum()
+                continue
+            mu = self._compute_mu_left(
+                X[:, nd.feature], nd.feature, nd.threshold, nd.margin,
+                nd.is_categorical, nd.categories_left, nd.nan_go_left)
+            stack.append((nd.left, wc * mu))
+            stack.append((nd.right, wc * (1.0 - mu)))
+
     def _build_depth_first(self, X, y, w, depth, X_bins=None):
         eff = w.sum()
         val = self._compute_leaf_value(y, w)
@@ -971,11 +1305,18 @@ class FuzzyDTree:
         if sample_weight is not None:
             w = np.asarray(sample_weight, dtype=np.float64).ravel()
 
+        use_lookahead = (int(self.lookahead_horizon) >= 1
+                         and self.max_leaves is None)
+
         c_tree = None
-        if self.max_leaves is None:
+        if self.max_leaves is None and not use_lookahead:
             c_tree = self._try_build_c_depth_first(X, y, w, X_bins)
 
-        if c_tree is not None:
+        if use_lookahead:
+            c_tree = self._try_build_c_lookahead(X, y, w, X_bins)
+            self.tree_ = c_tree if c_tree is not None else \
+                self._build_lookahead(X, y, w)
+        elif c_tree is not None:
             self.tree_ = c_tree
         elif self.max_leaves is not None:
             self.tree_ = self._build_best_first(X, y, w, X_bins)

@@ -92,7 +92,45 @@ where S is a smooth quadratic spline that transitions from 1 to 0 over the inter
 
 ### Per-Split Margin Optimisation
 
-The transition width (margin) is not a global hyperparameter — it is optimised independently at every split node. During training, a geometric grid of margin candidates (ranging from 0.4× to 20× the feature's standard deviation) is evaluated in parallel alongside threshold candidates. The (threshold, margin) pair that maximises the split criterion is selected. This allows the tree to learn sharp boundaries where the data demands them and gradual transitions where they improve generalisation.
+The transition width (**margin**) is not a global hyperparameter — it is chosen independently at every split node. During training, a geometric grid of margin candidates is evaluated alongside the threshold candidates, and the best `(threshold, margin)` pair is selected. The grid spans `margin_min_scale` to `margin_max_scale` times the feature's local standard deviation, and — when `include_hard_splits=True` — also includes a `margin = 0` candidate (a true hard step). By default the margin is then refined by held-out **cross-validation** (`margin_cv_folds`), so a soft boundary is only kept where it actually generalises.
+
+### Hard Splits and Margin Scale — Controlling Smoothness
+
+**These two knobs decide whether the tree behaves like a smooth surface or a staircase — set them to match your data.**
+
+The **margin** is the half-width of a split's fuzzy transition zone (as a multiple of the feature's local std). A small margin ≈ a sharp step; a large margin ≈ a gentle ramp. `include_hard_splits` additionally allows an exact `margin = 0` (hard) split.
+
+The catch that makes this *crucial*: **a hard split always separates the training data at least as sharply as any soft one.** So if hard splits are on the menu *and* margins are picked by training impurity alone (`margin_cv_folds=0`), the tree collapses to all-hard splits — an ordinary staircase tree, and the fuzziness is gone. Even with margin CV on, the per-split, two-child criterion still leaves many boundaries hard on smooth data (≈70% in our hill benchmark), which visibly degrades a smooth surface (R² 0.94 → 0.91).
+
+Guidance by data type:
+
+| Your features / target | `include_hard_splits` | `margin_min_scale` | Why |
+|---|---|---|---|
+| **Smooth continuous** (sensor/physical surfaces, well-calibrated probabilities) | `False` | `0.4` | Forces every split to be a genuine ramp ≥ 0.4×std wide → smooth, no staircase artifacts |
+| **Mixed / unsure** | `True` (default) | default (`1e-4`) | Let margin CV (`margin_cv_folds≥2`) soften only the splits where it generalises |
+| **Crisp thresholds** (integer counts like "≥1 delinquency", step-like signals) | `True` (default) | default | The signal *is* a sharp step — fuzzing it blurs exactly what matters |
+
+`margin_max_scale` (default `20.0`) caps how *blurry* a split may get: a very large margin averages across most of the feature range and underfits. Lower it if predictions look over-smoothed; raise it for very smooth, low-noise targets.
+
+```python
+# Smooth regression surface — the configuration behind the hill figures:
+FuzzyTreeRegressor(max_depth=12, include_hard_splits=False, margin_min_scale=0.4)
+
+# Crisp threshold data (e.g. credit delinquency counts) — keep hard splits:
+FuzzyTreeClassifier(max_depth=8)   # defaults: include_hard_splits=True
+```
+
+### Forward-Looking Splits (Lookahead)
+
+Greedy tree growth picks each split by its *immediate* impurity — it can't see that a locally-best split leads to a worse subtree downstream. With `lookahead_horizon >= 1`, the tree instead chooses each split **by the quality of the subtree it produces** (AlphaZero-style: pick the move by the resulting position). At each node it shortlists the top `lookahead_candidates` splits, rolls each one out into a subtree that many levels deep, scores that subtree on an internal held-out set, and commits the split whose rollout generalises best — then recurses.
+
+This is a separate, **numeric-only** build path: regressors and classifiers use a C-accelerated grower when available (with Python fallback). It ignores `max_leaves` and only considers numeric features as split candidates. It tends to fix *structural* mistakes (which feature/threshold) rather than smoothness — for a smooth surface, `include_hard_splits=False` is the cheaper lever. Start with `lookahead_horizon=1` or `2` and a small `lookahead_candidates`.
+
+Lookahead and margin CV **compose**: lookahead chooses each split's *feature and threshold* by rollout quality, and then — exactly as in the greedy path — `margin_cv_folds (>= 2)` re-selects that split's *margin* by out-of-fold loss (holding the feature/threshold fixed). So with the defaults (`margin_cv_folds=10`), turning on lookahead gives you forward-looking structure **and** cross-validated smoothness; set `margin_cv_folds=0` to let the rollout's own held-out margin stand without the extra CV step.
+
+```python
+FuzzyTreeRegressor(max_depth=6, lookahead_horizon=2)   # forward-looking growth
+```
 
 ### Joint Leaf Value Optimisation (Regressor)
 
@@ -113,16 +151,24 @@ The classifier uses a dedicated split kernel that operates on per-class fuzzy we
 | `min_samples_leaf` | 1.0 | Minimum effective (weighted) sample count per child |
 | `max_features` | None | Number of features considered per split (`None` = all; also accepts `'sqrt'`, `'log2'`, `int`, or `float`) |
 | `margin_grid_size` | 10 | Number of margin candidates in the geometric grid per split |
+| `include_hard_splits` | True | Add an exact `margin = 0` (hard step) candidate to the margin grid. Set `False` to force genuinely fuzzy splits — **essential for smooth surfaces** (see *Hard Splits and Margin Scale* above) |
+| `margin_min_scale` | 1e-4 | Smallest non-zero margin as a multiple of the feature's local std. Raise to `~0.4` to force visibly soft splits on smooth data |
+| `margin_max_scale` | 20.0 | Largest margin as a multiple of local std — caps how blurry a split can get |
+| `margin_cv_folds` | 10 | If ≥ 2, choose each split's margin by k-fold held-out loss (soft only where it generalises); `0` selects on training impurity (collapses to hard when `include_hard_splits=True`) |
+| `margin_cv_repeats` | 3 | Independent CV partitions averaged when scoring margins — reduces seed-to-seed variance ~√R |
+| `lookahead_horizon` | 0 | If ≥ 1, choose splits by the held-out quality of the subtree they produce (forward-looking). Slower, numeric-only; `0` = greedy |
+| `lookahead_candidates` | 4 | Splits shortlisted and rolled out per node when `lookahead_horizon ≥ 1` |
+| `lookahead_val_fraction` | 0.3 | Rows held out internally to score lookahead rollouts |
 | `margin_depth_decay` | 1.0 | Exponential decay factor for the margin upper bound at each depth level (unnecessary with S-curve splits; kept for compatibility) |
 | `max_bins` | 256 | Maximum histogram bins for threshold candidates |
 | `min_train_weight_fraction` | 0.01 | Minimum relative training weight retained when propagating fuzzy child weights |
 | `prebin_numeric` | True | Pre-bin numeric features once before split search for faster histogram-based training |
-| `optimize_leaf_values` | True | Re-solve all leaf values jointly via weighted least-squares after tree construction |
+| `optimize_leaf_values` | False | Re-solve all leaf values jointly via weighted least-squares after tree construction (off by default; margin CV is the primary regulariser) |
 | `optimize_split_gain` | False | Use exact two-leaf least-squares objective for split evaluation (slower and experimental) |
 | `leaf_l2` | 0.1 | L2 regularisation strength for the joint leaf-value optimisation |
 | `leaf_l2_mode` | `'centered'` | Ridge target for leaf optimisation: `'centered'` shrinks toward the training target mean; `'zero'` shrinks toward zero |
 | `split_gain_l2` | 0.0 | Ridge strength for `optimize_split_gain=True`; use `'leaf_l2'` to align split ranking with leaf optimisation |
-| `refine_splits` | True | Run a post-fit coordinate-refinement pass over numeric thresholds and margins using training MSE |
+| `refine_splits` | False | Run a post-fit coordinate-refinement pass over numeric thresholds and margins using training MSE |
 | `refine_splits_max_iter` | 1 | Maximum split-refinement passes |
 | `refine_splits_candidates` | 4 | Number of local threshold/margin candidates tried per numeric split during refinement |
 | `categorical_features` | None | Indices of categorical columns, or `'auto'` for automatic detection |
@@ -131,7 +177,7 @@ The classifier uses a dedicated split kernel that operates on per-class fuzzy we
 
 ### FuzzyTreeClassifier
 
-The classifier accepts all base tree parameters listed above, excluding the regressor-specific parameters (`optimize_leaf_values`, `optimize_split_gain`, `leaf_l2`, `leaf_l2_mode`, `split_gain_l2`, `refine_splits`, `refine_splits_max_iter`, and `refine_splits_candidates`).
+The classifier accepts all base tree parameters listed above (including `include_hard_splits`, `margin_min_scale`/`margin_max_scale`, `margin_cv_folds`/`margin_cv_repeats`, and `lookahead_horizon`). It also supports `optimize_leaf_values`, `refine_splits`, `refine_splits_max_iter`, and `refine_splits_candidates` (default off), but not the regressor-only `optimize_split_gain`, `leaf_l2`, `leaf_l2_mode`, or `split_gain_l2`.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|

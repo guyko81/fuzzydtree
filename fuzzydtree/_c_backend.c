@@ -5,6 +5,7 @@
 
 #include <math.h>
 #include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -101,6 +102,14 @@ typedef struct {
 } CNode;
 
 typedef struct {
+    double red;
+    int feature;
+    int threshold_idx;
+    double threshold;
+    int nan_go_left;
+} LAThresholdCandidate;
+
+typedef struct {
     double imp;
     int feature;
     int threshold_idx;
@@ -117,6 +126,78 @@ typedef struct {
     double   *left_w;
     double   *right_w;
 } DepthWork;
+
+typedef struct {
+    npy_intp *left_idx;
+    npy_intp *right_idx;
+    double   *left_w;
+    double   *right_w;
+    double   *val_left_w;
+    double   *val_right_w;
+} LookaheadDepthWork;
+
+typedef struct {
+    double *left_w;
+    double *right_w;
+} LookaheadRolloutWork;
+
+typedef struct {
+    const double *X;
+    const int *X_bins;
+    const double *y;
+    const double *Xv;
+    const double *yv;
+    npy_intp n_features;
+    npy_intp n_val;
+    const double *thresholds_flat;
+    const double *centers_flat;
+    const int *n_thresholds;
+    int max_thresholds;
+    int margin_grid_size;
+    int include_hard_splits;
+    double margin_min_scale;
+    double margin_max_scale;
+    double margin_depth_decay;
+    double min_samples_leaf;
+    double min_train_weight_fraction;
+    int lookahead_horizon;
+    int lookahead_candidates;
+    double lookahead_min_val;
+    int margin_cv_folds;
+    int margin_cv_repeats;
+    uint64_t cv_rng_state;
+    int n_classes;
+    int split_criterion;
+
+    double *prefix_buf;
+    double *margin_buf;
+    double *hist_buf;
+    double *nan_buf;
+    double *xstat_buf;
+    double *class_hist_buf;
+    double *nan_class_buf;
+    double *class_left_buf;
+    double *class_total_buf;
+    int *int_scratch;
+    LAThresholdCandidate *shortlist;
+    double *candidate_left_w;
+    double *candidate_right_w;
+    LookaheadRolloutWork *rollout_work;
+    CNode *temp_nodes;
+    double *temp_leaf_probs;
+    double *temp_pred_probs;
+    npy_int64 *temp_stack_nodes;
+    double *temp_stack_weights;
+    int max_rollout_nodes;
+
+    npy_intp *cv_perm;
+    int *cv_fold_ids;
+    double *cv_mu_buf;
+    double *cv_losses;
+    unsigned char *cv_valid;
+    double *cv_class_left;
+    double *cv_class_right;
+} LookaheadContext;
 
 /* ---------- helpers -------------------------------------------------- */
 
@@ -189,6 +270,636 @@ accumulate_selected_features_bins(
             }
         }
     }
+}
+
+static void
+accumulate_selected_features_bins_la(
+    const double *FDT_RESTRICT X,
+    const int *FDT_RESTRICT X_bins,
+    const double *FDT_RESTRICT y,
+    npy_intp n_features,
+    const npy_intp *FDT_RESTRICT idx,
+    const double *FDT_RESTRICT weights,
+    npy_intp n,
+    const int *FDT_RESTRICT cand, int n_cand,
+    const int *FDT_RESTRICT cand_B,
+    int B_stride,
+    double *FDT_RESTRICT hist,
+    double *FDT_RESTRICT nan_buf,
+    double *FDT_RESTRICT xstat_buf,
+    int *FDT_RESTRICT first_buf,
+    int *FDT_RESTRICT has_two,
+    int *FDT_RESTRICT has_nan)
+{
+    memset(hist, 0,
+           (size_t)n_cand * 3 * (size_t)B_stride * sizeof(double));
+    memset(nan_buf, 0, (size_t)n_cand * 3 * sizeof(double));
+    memset(xstat_buf, 0, (size_t)n_cand * 3 * sizeof(double));
+    for (int c = 0; c < n_cand; ++c) {
+        first_buf[c] = -2;
+        has_two[c]   = 0;
+        has_nan[c]   = 0;
+    }
+
+    for (npy_intp i = 0; i < n; ++i) {
+        npy_intp row = idx[i];
+        double wi  = weights[i];
+        double yi  = y[row];
+        double wyi = wi * yi;
+        double wy2i = wyi * yi;
+        const int *row_bins = X_bins + row * n_features;
+        const double *row_x = X + row * n_features;
+        for (int c = 0; c < n_cand; ++c) {
+            int feature = cand[c];
+            int b = row_bins[feature];
+            if (b < 0) {
+                double *nan_c = nan_buf + c * 3;
+                nan_c[0] += wi;
+                nan_c[1] += wyi;
+                nan_c[2] += wy2i;
+                has_nan[c] = 1;
+            } else if (b < cand_B[c]) {
+                double *h = hist + (size_t)c * 3 * B_stride;
+                h[b]                += wi;
+                h[B_stride + b]     += wyi;
+                h[2 * B_stride + b] += wy2i;
+
+                double x = row_x[feature];
+                double *xs = xstat_buf + c * 3;
+                xs[0] += wi;
+                xs[1] += wi * x;
+                xs[2] += wi * x * x;
+
+                if (wi > 1e-12 && !has_two[c]) {
+                    if (first_buf[c] < 0) first_buf[c] = b;
+                    else if (b != first_buf[c]) has_two[c] = 1;
+                }
+            }
+        }
+    }
+}
+
+static double
+std_from_weighted_sums(double sw, double sx, double sx2)
+{
+    if (sw < 1e-12) return 0.0;
+    double mean = sx / sw;
+    double var = sx2 / sw - mean * mean;
+    return var > 0.0 ? sqrt(var) : 0.0;
+}
+
+static int
+append_unique_margin(double *margins, int n, double value)
+{
+    for (int i = 0; i < n; ++i) {
+        if (margins[i] == value) return n;
+    }
+    margins[n] = value;
+    return n + 1;
+}
+
+static int
+build_margin_grid_la(double feat_std, int depth, int include_hard_splits,
+                     double margin_min_scale, double margin_max_scale,
+                     int margin_grid_size, double margin_depth_decay,
+                     double *margins)
+{
+    int n = 0;
+    if (include_hard_splits) n = append_unique_margin(margins, n, 0.0);
+
+    if (feat_std < 1e-12) {
+        n = append_unique_margin(margins, n, 1e-12);
+        return n;
+    }
+
+    double lo = feat_std * margin_min_scale;
+    if (lo < 1e-12) lo = 1e-12;
+    double hi = feat_std * margin_max_scale;
+    hi *= pow(margin_depth_decay, depth);
+    if (hi < lo) hi = lo;
+
+    if (margin_grid_size <= 1) {
+        n = append_unique_margin(margins, n, lo);
+    } else {
+        double ratio = hi / lo;
+        for (int mi = 0; mi < margin_grid_size; ++mi) {
+            double value = lo * pow(
+                ratio, (double)mi / (double)(margin_grid_size - 1));
+            n = append_unique_margin(margins, n, value);
+        }
+    }
+    return n;
+}
+
+static double
+weighted_mean_indexed(
+    const double *FDT_RESTRICT y,
+    const npy_intp *FDT_RESTRICT idx,
+    const double *FDT_RESTRICT weights,
+    npy_intp n,
+    double *eff_out,
+    double *max_weight_out)
+{
+    double sw = 0.0, swy = 0.0, mw = 0.0;
+    for (npy_intp i = 0; i < n; ++i) {
+        double wi = weights[i];
+        sw += wi;
+        swy += wi * y[idx[i]];
+        if (wi > mw) mw = wi;
+    }
+    if (eff_out) *eff_out = sw;
+    if (max_weight_out) *max_weight_out = mw;
+    return sw > 1e-15 ? swy / sw : 0.0;
+}
+
+static double
+weighted_std_feature_raw(
+    const double *FDT_RESTRICT X,
+    npy_intp n_features,
+    const npy_intp *FDT_RESTRICT idx,
+    const double *FDT_RESTRICT weights,
+    npy_intp n,
+    int feature)
+{
+    double sw = 0.0, sx = 0.0, sx2 = 0.0;
+    for (npy_intp i = 0; i < n; ++i) {
+        double x = X[idx[i] * n_features + feature];
+        if (isnan(x)) continue;
+        double wi = weights[i];
+        sw += wi;
+        sx += wi * x;
+        sx2 += wi * x * x;
+    }
+    return std_from_weighted_sums(sw, sx, sx2);
+}
+
+static double
+mse_reduction_from_bins(
+    const double *FDT_RESTRICT bin_w,
+    const double *FDT_RESTRICT bin_wy,
+    const double *FDT_RESTRICT bin_wy2,
+    double nan_w, double nan_wy, double nan_wy2,
+    double nan_mu,
+    double w_total, double wy_total, double wy2_total,
+    double parent_loss,
+    int B,
+    const double *centers,
+    double threshold,
+    double margin,
+    double min_samples_leaf)
+{
+    double inv_margin = margin > 1e-12 ? 1.0 / margin : 0.0;
+    double sl = nan_mu * nan_w;
+    double wy_l = nan_mu * nan_wy;
+    double wy2_l = nan_mu * nan_wy2;
+
+    for (int b = 0; b < B; ++b) {
+        double mu;
+        if (inv_margin == 0.0) {
+            mu = centers[b] <= threshold ? 1.0 : 0.0;
+        } else {
+            mu = membership_value((centers[b] - threshold) * inv_margin);
+        }
+        sl += mu * bin_w[b];
+        wy_l += mu * bin_wy[b];
+        wy2_l += mu * bin_wy2[b];
+    }
+
+    double sr = w_total - sl;
+    if (sl < min_samples_leaf || sr < min_samples_leaf) return -INFINITY;
+
+    double mean_l = wy_l / sl;
+    double mean_r = (wy_total - wy_l) / sr;
+    double var_l = wy2_l / sl - mean_l * mean_l;
+    double var_r = (wy2_total - wy2_l) / sr - mean_r * mean_r;
+    if (var_l < 0.0) var_l = 0.0;
+    if (var_r < 0.0) var_r = 0.0;
+    double child_loss = (sl * var_l + sr * var_r) / w_total;
+    return parent_loss - child_loss;
+}
+
+static void
+insert_la_candidate(LAThresholdCandidate *shortlist, int *count, int max_count,
+                    double red, int feature, int threshold_idx,
+                    double threshold, int nan_go_left)
+{
+    if (max_count <= 0) return;
+    int n = *count;
+    if (n >= max_count && red <= shortlist[n - 1].red) return;
+    int pos = n < max_count ? n : max_count - 1;
+    if (n < max_count) *count = n + 1;
+    while (pos > 0 && red > shortlist[pos - 1].red) {
+        shortlist[pos] = shortlist[pos - 1];
+        --pos;
+    }
+    shortlist[pos].red = red;
+    shortlist[pos].feature = feature;
+    shortlist[pos].threshold_idx = threshold_idx;
+    shortlist[pos].threshold = threshold;
+    shortlist[pos].nan_go_left = nan_go_left;
+}
+
+static int
+lookahead_scan_regression(
+    LookaheadContext *ctx,
+    const npy_intp *idx,
+    const double *weights,
+    npy_intp n,
+    int depth,
+    int want_shortlist,
+    SplitResult *best)
+{
+    double eff = 0.0;
+    for (npy_intp i = 0; i < n; ++i) eff += weights[i];
+    if (eff < 2.0 * ctx->min_samples_leaf) return 0;
+
+    int n_features = (int)ctx->n_features;
+    int B_stride = ctx->max_thresholds + 1;
+    int *cand      = ctx->int_scratch;
+    int *cand_B    = ctx->int_scratch + n_features;
+    int *first_buf = ctx->int_scratch + 2 * n_features;
+    int *has_two_b = ctx->int_scratch + 3 * n_features;
+    int *has_nan_b = ctx->int_scratch + 4 * n_features;
+
+    int n_cand = 0;
+    for (int feature = 0; feature < n_features; ++feature) {
+        int T = ctx->n_thresholds[feature];
+        if (T <= 0) continue;
+        cand[n_cand] = feature;
+        cand_B[n_cand] = T + 1;
+        ++n_cand;
+    }
+    if (n_cand == 0) return 0;
+
+    accumulate_selected_features_bins_la(
+        ctx->X, ctx->X_bins, ctx->y, ctx->n_features,
+        idx, weights, n, cand, n_cand, cand_B, B_stride,
+        ctx->hist_buf, ctx->nan_buf, ctx->xstat_buf,
+        first_buf, has_two_b, has_nan_b);
+
+    if (want_shortlist) {
+        for (int i = 0; i < ctx->lookahead_candidates; ++i)
+            ctx->shortlist[i].red = -INFINITY;
+    } else {
+        best->imp = 1e-12;
+        best->feature = -1;
+        best->threshold_idx = -1;
+        best->margin_idx = -1;
+    }
+
+    int shortlist_count = 0;
+    for (int c = 0; c < n_cand; ++c) {
+        if (!has_two_b[c]) continue;
+
+        int feature = cand[c];
+        int B = cand_B[c];
+        int T = B - 1;
+        double *bin_w   = ctx->hist_buf + (size_t)c * 3 * B_stride;
+        double *bin_wy  = bin_w + B_stride;
+        double *bin_wy2 = bin_w + 2 * B_stride;
+        double nan_w  = ctx->nan_buf[c * 3];
+        double nan_wy = ctx->nan_buf[c * 3 + 1];
+        double nan_wy2 = ctx->nan_buf[c * 3 + 2];
+        double *xs = ctx->xstat_buf + c * 3;
+        double feat_std = std_from_weighted_sums(xs[0], xs[1], xs[2]);
+        int n_margins = build_margin_grid_la(
+            feat_std, depth, ctx->include_hard_splits,
+            ctx->margin_min_scale, ctx->margin_max_scale,
+            ctx->margin_grid_size, ctx->margin_depth_decay,
+            ctx->margin_buf);
+
+        double w_total = nan_w, wy_total = nan_wy, wy2_total = nan_wy2;
+        for (int b = 0; b < B; ++b) {
+            w_total += bin_w[b];
+            wy_total += bin_wy[b];
+            wy2_total += bin_wy2[b];
+        }
+        if (w_total < 1e-15) continue;
+
+        double parent_mean = wy_total / w_total;
+        double parent_loss = wy2_total / w_total - parent_mean * parent_mean;
+        if (parent_loss < 0.0) parent_loss = 0.0;
+
+        int nan_left = has_nan_b[c] ? (nan_w <= 0.5 * w_total) : 1;
+        double nan_mu = nan_left ? 1.0 : 0.0;
+        const double *thresholds =
+            ctx->thresholds_flat + feature * ctx->max_thresholds;
+        const double *centers =
+            ctx->centers_flat + feature * (ctx->max_thresholds + 1);
+
+        for (int ti = 0; ti < T; ++ti) {
+            double threshold = thresholds[ti];
+            double t_best = -INFINITY;
+            int t_best_margin = -1;
+            double t_best_margin_value = 0.0;
+            for (int mi = 0; mi < n_margins; ++mi) {
+                double margin = ctx->margin_buf[mi];
+                double red = mse_reduction_from_bins(
+                    bin_w, bin_wy, bin_wy2,
+                    nan_w, nan_wy, nan_wy2, nan_mu,
+                    w_total, wy_total, wy2_total, parent_loss,
+                    B, centers, threshold, margin,
+                    ctx->min_samples_leaf);
+                if (want_shortlist) {
+                    if (red > t_best) {
+                        t_best = red;
+                        t_best_margin = mi;
+                        t_best_margin_value = margin;
+                    }
+                } else if (red > best->imp) {
+                    best->imp = red;
+                    best->feature = feature;
+                    best->threshold_idx = ti;
+                    best->margin_idx = mi;
+                    best->threshold = threshold;
+                    best->margin = margin;
+                    best->nan_go_left = nan_left;
+                }
+            }
+            (void)t_best_margin;
+            (void)t_best_margin_value;
+            if (want_shortlist && t_best > 0.0) {
+                insert_la_candidate(
+                    ctx->shortlist, &shortlist_count,
+                    ctx->lookahead_candidates, t_best, feature, ti,
+                    threshold, nan_left);
+            }
+        }
+    }
+
+    return want_shortlist ? shortlist_count : (best->feature >= 0);
+}
+
+static void
+accumulate_selected_features_class_bins_la(
+    const double *FDT_RESTRICT X,
+    const int *FDT_RESTRICT X_bins,
+    const double *FDT_RESTRICT y,
+    npy_intp n_features,
+    const npy_intp *FDT_RESTRICT idx,
+    const double *FDT_RESTRICT weights,
+    npy_intp n,
+    const int *FDT_RESTRICT cand, int n_cand,
+    const int *FDT_RESTRICT cand_B,
+    int B_stride,
+    int n_classes,
+    double *FDT_RESTRICT class_hist,
+    double *FDT_RESTRICT nan_class,
+    double *FDT_RESTRICT xstat_buf,
+    int *FDT_RESTRICT first_buf,
+    int *FDT_RESTRICT has_two,
+    int *FDT_RESTRICT has_nan)
+{
+    memset(class_hist, 0,
+           (size_t)n_cand * (size_t)B_stride * (size_t)n_classes
+           * sizeof(double));
+    memset(nan_class, 0,
+           (size_t)n_cand * (size_t)n_classes * sizeof(double));
+    memset(xstat_buf, 0, (size_t)n_cand * 3 * sizeof(double));
+    for (int c = 0; c < n_cand; ++c) {
+        first_buf[c] = -2;
+        has_two[c] = 0;
+        has_nan[c] = 0;
+    }
+
+    for (npy_intp i = 0; i < n; ++i) {
+        npy_intp row = idx[i];
+        double wi = weights[i];
+        int cls = (int)y[row];
+        if (cls < 0 || cls >= n_classes) continue;
+        const int *row_bins = X_bins + row * n_features;
+        const double *row_x = X + row * n_features;
+        for (int c = 0; c < n_cand; ++c) {
+            int feature = cand[c];
+            int b = row_bins[feature];
+            if (b < 0) {
+                nan_class[c * n_classes + cls] += wi;
+                has_nan[c] = 1;
+            } else if (b < cand_B[c]) {
+                class_hist[((size_t)c * (size_t)B_stride + (size_t)b)
+                           * (size_t)n_classes + (size_t)cls] += wi;
+
+                double x = row_x[feature];
+                double *xs = xstat_buf + c * 3;
+                xs[0] += wi;
+                xs[1] += wi * x;
+                xs[2] += wi * x * x;
+
+                if (wi > 1e-12 && !has_two[c]) {
+                    if (first_buf[c] < 0) first_buf[c] = b;
+                    else if (b != first_buf[c]) has_two[c] = 1;
+                }
+            }
+        }
+    }
+}
+
+static double
+class_impurity_from_counts(const double *counts, int n_classes,
+                           double total, int split_criterion)
+{
+    if (total < 1e-15) return 0.0;
+    if (split_criterion == 1) {
+        double entropy = 0.0;
+        for (int c = 0; c < n_classes; ++c) {
+            double p = counts[c] / total;
+            if (p > 1e-15) entropy -= p * log(p);
+        }
+        return entropy;
+    }
+
+    double sum_sq = 0.0;
+    for (int c = 0; c < n_classes; ++c) {
+        double p = counts[c] / total;
+        sum_sq += p * p;
+    }
+    return 1.0 - sum_sq;
+}
+
+static double
+classifier_reduction_from_bins(
+    const double *FDT_RESTRICT class_hist,
+    const double *FDT_RESTRICT nan_class,
+    double nan_mu,
+    const double *FDT_RESTRICT total_counts,
+    double parent_impurity,
+    double w_total,
+    int B,
+    int n_classes,
+    const double *centers,
+    double threshold,
+    double margin,
+    double min_samples_leaf,
+    int split_criterion,
+    double *FDT_RESTRICT left_counts)
+{
+    double inv_margin = margin > 1e-12 ? 1.0 / margin : 0.0;
+    double sl = 0.0;
+    for (int c = 0; c < n_classes; ++c) {
+        double v = nan_mu * nan_class[c];
+        left_counts[c] = v;
+        sl += v;
+    }
+
+    for (int b = 0; b < B; ++b) {
+        double mu;
+        if (inv_margin == 0.0) {
+            mu = centers[b] <= threshold ? 1.0 : 0.0;
+        } else {
+            mu = membership_value((centers[b] - threshold) * inv_margin);
+        }
+        const double *bin = class_hist + (size_t)b * (size_t)n_classes;
+        for (int c = 0; c < n_classes; ++c) {
+            double v = mu * bin[c];
+            left_counts[c] += v;
+            sl += v;
+        }
+    }
+
+    double sr = w_total - sl;
+    if (sl < min_samples_leaf || sr < min_samples_leaf) return -INFINITY;
+
+    double left_imp = class_impurity_from_counts(
+        left_counts, n_classes, sl, split_criterion);
+    double right_imp;
+    {
+        double right_total = 0.0;
+        for (int c = 0; c < n_classes; ++c) {
+            left_counts[c] = total_counts[c] - left_counts[c];
+            right_total += left_counts[c];
+        }
+        right_imp = class_impurity_from_counts(
+            left_counts, n_classes, right_total, split_criterion);
+    }
+
+    double child_impurity = (sl * left_imp + sr * right_imp) / w_total;
+    return parent_impurity - child_impurity;
+}
+
+static int
+lookahead_scan_classifier(
+    LookaheadContext *ctx,
+    const npy_intp *idx,
+    const double *weights,
+    npy_intp n,
+    int depth,
+    int want_shortlist,
+    SplitResult *best)
+{
+    double eff = 0.0;
+    for (npy_intp i = 0; i < n; ++i) eff += weights[i];
+    if (eff < 2.0 * ctx->min_samples_leaf) return 0;
+
+    int n_features = (int)ctx->n_features;
+    int n_classes = ctx->n_classes;
+    int B_stride = ctx->max_thresholds + 1;
+    int *cand      = ctx->int_scratch;
+    int *cand_B    = ctx->int_scratch + n_features;
+    int *first_buf = ctx->int_scratch + 2 * n_features;
+    int *has_two_b = ctx->int_scratch + 3 * n_features;
+    int *has_nan_b = ctx->int_scratch + 4 * n_features;
+
+    int n_cand = 0;
+    for (int feature = 0; feature < n_features; ++feature) {
+        int T = ctx->n_thresholds[feature];
+        if (T <= 0) continue;
+        cand[n_cand] = feature;
+        cand_B[n_cand] = T + 1;
+        ++n_cand;
+    }
+    if (n_cand == 0) return 0;
+
+    accumulate_selected_features_class_bins_la(
+        ctx->X, ctx->X_bins, ctx->y, ctx->n_features,
+        idx, weights, n, cand, n_cand, cand_B, B_stride,
+        n_classes, ctx->class_hist_buf, ctx->nan_class_buf,
+        ctx->xstat_buf, first_buf, has_two_b, has_nan_b);
+
+    if (want_shortlist) {
+        for (int i = 0; i < ctx->lookahead_candidates; ++i)
+            ctx->shortlist[i].red = -INFINITY;
+    } else {
+        best->imp = 1e-12;
+        best->feature = -1;
+        best->threshold_idx = -1;
+        best->margin_idx = -1;
+    }
+
+    int shortlist_count = 0;
+    for (int c = 0; c < n_cand; ++c) {
+        if (!has_two_b[c]) continue;
+
+        int feature = cand[c];
+        int B = cand_B[c];
+        int T = B - 1;
+        double *class_hist = ctx->class_hist_buf
+            + (size_t)c * (size_t)B_stride * (size_t)n_classes;
+        double *nan_class = ctx->nan_class_buf + c * n_classes;
+        double *xs = ctx->xstat_buf + c * 3;
+        double feat_std = std_from_weighted_sums(xs[0], xs[1], xs[2]);
+        int n_margins = build_margin_grid_la(
+            feat_std, depth, ctx->include_hard_splits,
+            ctx->margin_min_scale, ctx->margin_max_scale,
+            ctx->margin_grid_size, ctx->margin_depth_decay,
+            ctx->margin_buf);
+
+        double w_total = 0.0;
+        double nan_w = 0.0;
+        for (int k = 0; k < n_classes; ++k) {
+            double total = nan_class[k];
+            nan_w += nan_class[k];
+            for (int b = 0; b < B; ++b) {
+                total += class_hist[((size_t)b * (size_t)n_classes)
+                                    + (size_t)k];
+            }
+            ctx->class_total_buf[k] = total;
+            w_total += total;
+        }
+        if (w_total < 1e-15) continue;
+
+        double parent_impurity = class_impurity_from_counts(
+            ctx->class_total_buf, n_classes, w_total,
+            ctx->split_criterion);
+
+        int nan_left = has_nan_b[c] ? (nan_w <= 0.5 * w_total) : 1;
+        double nan_mu = nan_left ? 1.0 : 0.0;
+        const double *thresholds =
+            ctx->thresholds_flat + feature * ctx->max_thresholds;
+        const double *centers =
+            ctx->centers_flat + feature * (ctx->max_thresholds + 1);
+
+        for (int ti = 0; ti < T; ++ti) {
+            double threshold = thresholds[ti];
+            double t_best = -INFINITY;
+            for (int mi = 0; mi < n_margins; ++mi) {
+                double margin = ctx->margin_buf[mi];
+                double red = classifier_reduction_from_bins(
+                    class_hist, nan_class, nan_mu, ctx->class_total_buf,
+                    parent_impurity, w_total, B, n_classes, centers,
+                    threshold, margin, ctx->min_samples_leaf,
+                    ctx->split_criterion, ctx->class_left_buf);
+                if (want_shortlist) {
+                    if (red > t_best) t_best = red;
+                } else if (red > best->imp) {
+                    best->imp = red;
+                    best->feature = feature;
+                    best->threshold_idx = ti;
+                    best->margin_idx = mi;
+                    best->threshold = threshold;
+                    best->margin = margin;
+                    best->nan_go_left = nan_left;
+                }
+            }
+            if (want_shortlist && t_best > 0.0) {
+                insert_la_candidate(
+                    ctx->shortlist, &shortlist_count,
+                    ctx->lookahead_candidates, t_best, feature, ti,
+                    threshold, nan_left);
+            }
+        }
+    }
+
+    return want_shortlist ? shortlist_count : (best->feature >= 0);
 }
 
 /* Approximate feature std from pre-accumulated bin stats (O(B)). */
@@ -696,6 +1407,1277 @@ build_depth_first_numeric(
     if (left_id < 0 || right_id < 0) return -1;
 
     nodes[node_id].left  = left_id;
+    nodes[node_id].right = right_id;
+    return node_id;
+}
+
+static void
+split_weights_raw(
+    const double *FDT_RESTRICT X,
+    npy_intp n_features,
+    const npy_intp *FDT_RESTRICT idx,
+    const double *FDT_RESTRICT weights,
+    npy_intp n,
+    int feature,
+    double threshold,
+    double margin,
+    int nan_go_left,
+    double *FDT_RESTRICT left_w,
+    double *FDT_RESTRICT right_w,
+    double *left_sum,
+    double *right_sum)
+{
+    double sl = 0.0, sr = 0.0;
+    for (npy_intp i = 0; i < n; ++i) {
+        double x = X[idx[i] * n_features + feature];
+        double mu = mu_left_numeric(x, threshold, margin, nan_go_left);
+        double wl = weights[i] * mu;
+        double wr = weights[i] * (1.0 - mu);
+        left_w[i] = wl;
+        right_w[i] = wr;
+        sl += wl;
+        sr += wr;
+    }
+    if (left_sum) *left_sum = sl;
+    if (right_sum) *right_sum = sr;
+}
+
+static double
+split_child_loss_raw(
+    const double *FDT_RESTRICT y,
+    const npy_intp *FDT_RESTRICT idx,
+    const double *FDT_RESTRICT left_w,
+    const double *FDT_RESTRICT right_w,
+    npy_intp n,
+    double parent_eff)
+{
+    double sl = 0.0, swyl = 0.0, swy2l = 0.0;
+    double sr = 0.0, swyr = 0.0, swy2r = 0.0;
+    for (npy_intp i = 0; i < n; ++i) {
+        double yi = y[idx[i]];
+        double wl = left_w[i];
+        double wr = right_w[i];
+        sl += wl;
+        swyl += wl * yi;
+        swy2l += wl * yi * yi;
+        sr += wr;
+        swyr += wr * yi;
+        swy2r += wr * yi * yi;
+    }
+    if (sl < 1e-15 || sr < 1e-15 || parent_eff < 1e-15) return 0.0;
+    double ml = swyl / sl;
+    double mr = swyr / sr;
+    double vl = swy2l / sl - ml * ml;
+    double vr = swy2r / sr - mr * mr;
+    if (vl < 0.0) vl = 0.0;
+    if (vr < 0.0) vr = 0.0;
+    return (sl * vl + sr * vr) / parent_eff;
+}
+
+static uint64_t
+cv_next_u64(LookaheadContext *ctx)
+{
+    uint64_t x = ctx->cv_rng_state;
+    if (x == 0) x = 0x9e3779b97f4a7c15ULL;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    ctx->cv_rng_state = x;
+    return x * 2685821657736338717ULL;
+}
+
+static void
+cv_make_fold_ids(LookaheadContext *ctx, npy_intp n, int folds)
+{
+    for (npy_intp i = 0; i < n; ++i) ctx->cv_perm[i] = i;
+    for (npy_intp i = n - 1; i > 0; --i) {
+        npy_intp j = (npy_intp)(
+            cv_next_u64(ctx) % (uint64_t)(i + 1));
+        npy_intp tmp = ctx->cv_perm[i];
+        ctx->cv_perm[i] = ctx->cv_perm[j];
+        ctx->cv_perm[j] = tmp;
+    }
+    for (npy_intp i = 0; i < n; ++i) {
+        ctx->cv_fold_ids[i] = (int)(ctx->cv_perm[i] % folds);
+    }
+}
+
+static int
+build_rollout_regression(
+    LookaheadContext *ctx,
+    const npy_intp *idx,
+    const double *weights,
+    npy_intp n,
+    int depth,
+    int *node_count);
+
+static int
+build_rollout_classifier(
+    LookaheadContext *ctx,
+    const npy_intp *idx,
+    const double *weights,
+    npy_intp n,
+    int depth,
+    int *node_count);
+
+static double
+temp_tree_validation_loss_indexed(
+    LookaheadContext *ctx,
+    int root_id,
+    const npy_intp *idx,
+    const double *weights,
+    const int *fold_ids,
+    npy_intp n,
+    int fold)
+{
+    double loss = 0.0;
+    double denom = 0.0;
+    double unweighted_loss = 0.0;
+    npy_intp n_val = 0;
+
+    for (npy_intp i = 0; i < n; ++i) {
+        if (fold_ids[i] != fold) continue;
+        ++n_val;
+
+        double pred = 0.0;
+        npy_intp top = 0;
+        ctx->temp_stack_nodes[top] = root_id;
+        ctx->temp_stack_weights[top] = 1.0;
+        ++top;
+
+        while (top > 0) {
+            --top;
+            npy_int64 node_idx = ctx->temp_stack_nodes[top];
+            double path_w = ctx->temp_stack_weights[top];
+            CNode *node = &ctx->temp_nodes[node_idx];
+            if (node->left < 0) {
+                pred += path_w * node->value;
+                continue;
+            }
+
+            double x = ctx->X[idx[i] * ctx->n_features + node->feature];
+            double mu = mu_left_numeric(
+                x, node->threshold, node->margin, node->nan_go_left);
+            if (mu > 0.0) {
+                ctx->temp_stack_nodes[top] = node->left;
+                ctx->temp_stack_weights[top] = path_w * mu;
+                ++top;
+            }
+            if (mu < 1.0) {
+                ctx->temp_stack_nodes[top] = node->right;
+                ctx->temp_stack_weights[top] = path_w * (1.0 - mu);
+                ++top;
+            }
+        }
+
+        double r = ctx->y[idx[i]] - pred;
+        double wi = weights[i];
+        loss += wi * r * r;
+        denom += wi;
+        unweighted_loss += r * r;
+    }
+
+    if (denom > 1e-12) return loss / denom;
+    return n_val > 0 ? unweighted_loss / (double)n_val : 0.0;
+}
+
+static double
+temp_tree_validation_logloss_indexed(
+    LookaheadContext *ctx,
+    int root_id,
+    const npy_intp *idx,
+    const double *weights,
+    const int *fold_ids,
+    npy_intp n,
+    int fold)
+{
+    int K = ctx->n_classes;
+    double loss = 0.0;
+    double denom = 0.0;
+    double unweighted_loss = 0.0;
+    npy_intp n_val = 0;
+
+    for (npy_intp i = 0; i < n; ++i) {
+        if (fold_ids[i] != fold) continue;
+        ++n_val;
+        for (int c = 0; c < K; ++c) ctx->temp_pred_probs[c] = 0.0;
+
+        npy_intp top = 0;
+        ctx->temp_stack_nodes[top] = root_id;
+        ctx->temp_stack_weights[top] = 1.0;
+        ++top;
+
+        while (top > 0) {
+            --top;
+            npy_int64 node_idx = ctx->temp_stack_nodes[top];
+            double path_w = ctx->temp_stack_weights[top];
+            CNode *node = &ctx->temp_nodes[node_idx];
+            if (node->left < 0) {
+                double *p = ctx->temp_leaf_probs
+                    + (size_t)node_idx * (size_t)K;
+                for (int c = 0; c < K; ++c)
+                    ctx->temp_pred_probs[c] += path_w * p[c];
+                continue;
+            }
+
+            double x = ctx->X[idx[i] * ctx->n_features + node->feature];
+            double mu = mu_left_numeric(
+                x, node->threshold, node->margin, node->nan_go_left);
+            if (mu > 0.0) {
+                ctx->temp_stack_nodes[top] = node->left;
+                ctx->temp_stack_weights[top] = path_w * mu;
+                ++top;
+            }
+            if (mu < 1.0) {
+                ctx->temp_stack_nodes[top] = node->right;
+                ctx->temp_stack_weights[top] = path_w * (1.0 - mu);
+                ++top;
+            }
+        }
+
+        int cls = (int)ctx->y[idx[i]];
+        double p = (cls >= 0 && cls < K) ? ctx->temp_pred_probs[cls] : 0.0;
+        if (p < 1e-12) p = 1e-12;
+        if (p > 1.0) p = 1.0;
+        double li = -log(p);
+        double wi = weights[i];
+        loss += wi * li;
+        denom += wi;
+        unweighted_loss += li;
+    }
+
+    if (denom > 1e-12) return loss / denom;
+    return n_val > 0 ? unweighted_loss / (double)n_val : 0.0;
+}
+
+static int
+cv_select_margin_regression(
+    LookaheadContext *ctx,
+    const npy_intp *idx,
+    const double *weights,
+    npy_intp n,
+    int feature,
+    double threshold,
+    int nan_go_left,
+    int depth,
+    double *selected_margin)
+{
+    int folds = ctx->margin_cv_folds;
+    int repeats = ctx->margin_cv_repeats > 1 ? ctx->margin_cv_repeats : 1;
+    if (folds < 2 || n < (npy_intp)2 * (npy_intp)folds) return 0;
+    if (!ctx->cv_perm || !ctx->cv_fold_ids || !ctx->cv_mu_buf ||
+            !ctx->cv_losses || !ctx->cv_valid) {
+        return -1;
+    }
+
+    int max_margins = ctx->margin_grid_size + (
+        ctx->include_hard_splits ? 1 : 0) + 1;
+    if (max_margins < 1) max_margins = 1;
+    double *margins = (double *)malloc((size_t)max_margins * sizeof(double));
+    if (!margins) return -1;
+
+    double feat_std = weighted_std_feature_raw(
+        ctx->X, ctx->n_features, idx, weights, n, feature);
+    int n_margins = build_margin_grid_la(
+        feat_std, depth, ctx->include_hard_splits,
+        ctx->margin_min_scale, ctx->margin_max_scale,
+        ctx->margin_grid_size, ctx->margin_depth_decay,
+        margins);
+    if (n_margins <= 1) {
+        free(margins);
+        return 0;
+    }
+
+    for (int mi = 0; mi < n_margins; ++mi) {
+        ctx->cv_losses[mi] = 0.0;
+        ctx->cv_valid[mi] = 1;
+    }
+
+    double *train_w = ctx->cv_mu_buf;
+    for (int rep = 0; rep < repeats; ++rep) {
+        cv_make_fold_ids(ctx, n, folds);
+        for (int fold = 0; fold < folds; ++fold) {
+            npy_intp n_val = 0, n_train = 0;
+            for (npy_intp i = 0; i < n; ++i) {
+                if (ctx->cv_fold_ids[i] == fold) ++n_val;
+                else ++n_train;
+            }
+            if (n_val == 0 || n_train == 0) continue;
+
+            for (int mi = 0; mi < n_margins; ++mi) {
+                if (!ctx->cv_valid[mi]) continue;
+
+                for (npy_intp i = 0; i < n; ++i) {
+                    train_w[i] = ctx->cv_fold_ids[i] == fold
+                        ? 0.0 : weights[i];
+                }
+
+                double sl = 0.0, sr = 0.0;
+                double margin = margins[mi];
+                split_weights_raw(
+                    ctx->X, ctx->n_features, idx, train_w, n,
+                    feature, threshold, margin, nan_go_left,
+                    ctx->candidate_left_w, ctx->candidate_right_w,
+                    &sl, &sr);
+                if (sl < ctx->min_samples_leaf ||
+                        sr < ctx->min_samples_leaf) {
+                    ctx->cv_valid[mi] = 0;
+                    continue;
+                }
+
+                int node_count = 1;
+                CNode *root = &ctx->temp_nodes[0];
+                root->feature = feature;
+                root->threshold = threshold;
+                root->margin = margin;
+                root->left = -1;
+                root->right = -1;
+                root->value = 0.0;
+                root->n_samples = sl + sr;
+                root->impurity_reduction = 0.0;
+                root->nan_go_left = nan_go_left;
+
+                int left_id = build_rollout_regression(
+                    ctx, idx, ctx->candidate_left_w, n, 1, &node_count);
+                if (left_id < 0) {
+                    free(margins);
+                    return -1;
+                }
+                int right_id = build_rollout_regression(
+                    ctx, idx, ctx->candidate_right_w, n, 1, &node_count);
+                if (right_id < 0) {
+                    free(margins);
+                    return -1;
+                }
+                root->left = left_id;
+                root->right = right_id;
+
+                ctx->cv_losses[mi] += temp_tree_validation_loss_indexed(
+                    ctx, 0, idx, weights, ctx->cv_fold_ids, n, fold);
+            }
+        }
+    }
+
+    int best = -1;
+    double best_loss = INFINITY;
+    for (int mi = 0; mi < n_margins; ++mi) {
+        if (ctx->cv_valid[mi] && ctx->cv_losses[mi] < best_loss) {
+            best_loss = ctx->cv_losses[mi];
+            best = mi;
+        }
+    }
+    if (best < 0 || !isfinite(best_loss)) {
+        free(margins);
+        return 0;
+    }
+    *selected_margin = margins[best];
+    free(margins);
+    return 1;
+}
+
+static int
+cv_select_margin_classifier(
+    LookaheadContext *ctx,
+    const npy_intp *idx,
+    const double *weights,
+    npy_intp n,
+    int feature,
+    double threshold,
+    int nan_go_left,
+    int depth,
+    double *selected_margin)
+{
+    int folds = ctx->margin_cv_folds;
+    int repeats = ctx->margin_cv_repeats > 1 ? ctx->margin_cv_repeats : 1;
+    if (folds < 2 || n < (npy_intp)2 * (npy_intp)folds) return 0;
+    if (!ctx->cv_perm || !ctx->cv_fold_ids || !ctx->cv_mu_buf ||
+            !ctx->cv_losses || !ctx->cv_valid ||
+            !ctx->cv_class_left || !ctx->cv_class_right) {
+        return -1;
+    }
+
+    int max_margins = ctx->margin_grid_size + (
+        ctx->include_hard_splits ? 1 : 0) + 1;
+    if (max_margins < 1) max_margins = 1;
+    double *margins = (double *)malloc((size_t)max_margins * sizeof(double));
+    if (!margins) return -1;
+
+    double feat_std = weighted_std_feature_raw(
+        ctx->X, ctx->n_features, idx, weights, n, feature);
+    int n_margins = build_margin_grid_la(
+        feat_std, depth, ctx->include_hard_splits,
+        ctx->margin_min_scale, ctx->margin_max_scale,
+        ctx->margin_grid_size, ctx->margin_depth_decay,
+        margins);
+    if (n_margins <= 1) {
+        free(margins);
+        return 0;
+    }
+
+    for (int mi = 0; mi < n_margins; ++mi) {
+        ctx->cv_losses[mi] = 0.0;
+        ctx->cv_valid[mi] = 1;
+    }
+
+    double *train_w = ctx->cv_mu_buf;
+    for (int rep = 0; rep < repeats; ++rep) {
+        cv_make_fold_ids(ctx, n, folds);
+        for (int fold = 0; fold < folds; ++fold) {
+            npy_intp n_val = 0, n_train = 0;
+            for (npy_intp i = 0; i < n; ++i) {
+                if (ctx->cv_fold_ids[i] == fold) ++n_val;
+                else ++n_train;
+            }
+            if (n_val == 0 || n_train == 0) continue;
+
+            for (int mi = 0; mi < n_margins; ++mi) {
+                if (!ctx->cv_valid[mi]) continue;
+
+                for (npy_intp i = 0; i < n; ++i) {
+                    train_w[i] = ctx->cv_fold_ids[i] == fold
+                        ? 0.0 : weights[i];
+                }
+
+                double sl = 0.0, sr = 0.0;
+                double margin = margins[mi];
+                split_weights_raw(
+                    ctx->X, ctx->n_features, idx, train_w, n,
+                    feature, threshold, margin, nan_go_left,
+                    ctx->candidate_left_w, ctx->candidate_right_w,
+                    &sl, &sr);
+                if (sl < ctx->min_samples_leaf ||
+                        sr < ctx->min_samples_leaf) {
+                    ctx->cv_valid[mi] = 0;
+                    continue;
+                }
+
+                int node_count = 1;
+                CNode *root = &ctx->temp_nodes[0];
+                root->feature = feature;
+                root->threshold = threshold;
+                root->margin = margin;
+                root->left = -1;
+                root->right = -1;
+                root->value = 0.0;
+                root->n_samples = sl + sr;
+                root->impurity_reduction = 0.0;
+                root->nan_go_left = nan_go_left;
+
+                int left_id = build_rollout_classifier(
+                    ctx, idx, ctx->candidate_left_w, n, 1, &node_count);
+                if (left_id < 0) {
+                    free(margins);
+                    return -1;
+                }
+                int right_id = build_rollout_classifier(
+                    ctx, idx, ctx->candidate_right_w, n, 1, &node_count);
+                if (right_id < 0) {
+                    free(margins);
+                    return -1;
+                }
+                root->left = left_id;
+                root->right = right_id;
+
+                ctx->cv_losses[mi] += temp_tree_validation_logloss_indexed(
+                    ctx, 0, idx, weights, ctx->cv_fold_ids, n, fold);
+            }
+        }
+    }
+
+    int best = -1;
+    double best_loss = INFINITY;
+    for (int mi = 0; mi < n_margins; ++mi) {
+        if (ctx->cv_valid[mi] && ctx->cv_losses[mi] < best_loss) {
+            best_loss = ctx->cv_losses[mi];
+            best = mi;
+        }
+    }
+    if (best < 0 || !isfinite(best_loss)) {
+        free(margins);
+        return 0;
+    }
+    *selected_margin = margins[best];
+    free(margins);
+    return 1;
+}
+
+static int
+build_rollout_regression(
+    LookaheadContext *ctx,
+    const npy_intp *idx,
+    const double *weights,
+    npy_intp n,
+    int depth,
+    int *node_count)
+{
+    if (*node_count >= ctx->max_rollout_nodes) return -1;
+
+    int node_id = *node_count;
+    *node_count += 1;
+
+    double eff = 0.0, max_w = 0.0;
+    double value = weighted_mean_indexed(
+        ctx->y, idx, weights, n, &eff, &max_w);
+    (void)max_w;
+
+    CNode *node = &ctx->temp_nodes[node_id];
+    node->feature = -1;
+    node->threshold = 0.0;
+    node->margin = 0.0;
+    node->left = -1;
+    node->right = -1;
+    node->value = value;
+    node->n_samples = eff;
+    node->impurity_reduction = 0.0;
+    node->nan_go_left = 1;
+
+    if (depth >= ctx->lookahead_horizon ||
+        eff < 2.0 * ctx->min_samples_leaf) {
+        return node_id;
+    }
+
+    SplitResult best;
+    if (!lookahead_scan_regression(ctx, idx, weights, n, depth, 0, &best)) {
+        return node_id;
+    }
+
+    double sl = 0.0, sr = 0.0;
+    double *left_w = ctx->rollout_work[depth].left_w;
+    double *right_w = ctx->rollout_work[depth].right_w;
+    split_weights_raw(
+        ctx->X, ctx->n_features, idx, weights, n,
+        best.feature, best.threshold, best.margin, best.nan_go_left,
+        left_w, right_w, &sl, &sr);
+    if (sl < ctx->min_samples_leaf || sr < ctx->min_samples_leaf) {
+        return node_id;
+    }
+
+    node->feature = best.feature;
+    node->threshold = best.threshold;
+    node->margin = best.margin;
+    node->nan_go_left = best.nan_go_left;
+
+    int left_id = build_rollout_regression(
+        ctx, idx, left_w, n, depth + 1, node_count);
+    if (left_id < 0) return -1;
+    int right_id = build_rollout_regression(
+        ctx, idx, right_w, n, depth + 1, node_count);
+    if (right_id < 0) return -1;
+    node->left = left_id;
+    node->right = right_id;
+    return node_id;
+}
+
+static double
+temp_tree_validation_loss(
+    LookaheadContext *ctx,
+    int root_id,
+    const double *val_weights)
+{
+    double loss = 0.0;
+    double denom = 0.0;
+    double unweighted_loss = 0.0;
+
+    for (npy_intp i = 0; i < ctx->n_val; ++i) {
+        double pred = 0.0;
+        npy_intp top = 0;
+        ctx->temp_stack_nodes[top] = root_id;
+        ctx->temp_stack_weights[top] = 1.0;
+        ++top;
+
+        while (top > 0) {
+            --top;
+            npy_int64 node_idx = ctx->temp_stack_nodes[top];
+            double path_w = ctx->temp_stack_weights[top];
+            CNode *node = &ctx->temp_nodes[node_idx];
+            if (node->left < 0) {
+                pred += path_w * node->value;
+                continue;
+            }
+
+            double x = ctx->Xv[i * ctx->n_features + node->feature];
+            double mu = mu_left_numeric(
+                x, node->threshold, node->margin, node->nan_go_left);
+            if (mu > 0.0) {
+                ctx->temp_stack_nodes[top] = node->left;
+                ctx->temp_stack_weights[top] = path_w * mu;
+                ++top;
+            }
+            if (mu < 1.0) {
+                ctx->temp_stack_nodes[top] = node->right;
+                ctx->temp_stack_weights[top] = path_w * (1.0 - mu);
+                ++top;
+            }
+        }
+
+        double r = ctx->yv[i] - pred;
+        double wi = val_weights[i];
+        loss += wi * r * r;
+        denom += wi;
+        unweighted_loss += r * r;
+    }
+
+    if (denom > 1e-12) return loss / denom;
+    return ctx->n_val > 0 ? unweighted_loss / (double)ctx->n_val : 0.0;
+}
+
+static int
+find_lookahead_split_regression(
+    LookaheadContext *ctx,
+    const npy_intp *idx,
+    const double *weights,
+    npy_intp n,
+    const double *val_weights,
+    int depth,
+    SplitResult *best)
+{
+    int n_short = lookahead_scan_regression(
+        ctx, idx, weights, n, depth, 1, best);
+    if (n_short <= 0) {
+        best->feature = -1;
+        return 0;
+    }
+
+    best->feature = -1;
+    best->threshold_idx = -1;
+    best->margin_idx = -1;
+    best->imp = INFINITY;  /* validation loss while choosing */
+
+    int max_margins = ctx->margin_grid_size + (ctx->include_hard_splits ? 1 : 0);
+    if (max_margins < 1) max_margins = 1;
+    double *margins = (double *)malloc((size_t)max_margins * sizeof(double));
+    if (!margins) return -1;
+
+    for (int ci = 0; ci < n_short; ++ci) {
+        LAThresholdCandidate cand = ctx->shortlist[ci];
+        double feat_std = weighted_std_feature_raw(
+            ctx->X, ctx->n_features, idx, weights, n, cand.feature);
+        int n_margins = build_margin_grid_la(
+            feat_std, depth, ctx->include_hard_splits,
+            ctx->margin_min_scale, ctx->margin_max_scale,
+            ctx->margin_grid_size, ctx->margin_depth_decay,
+            margins);
+
+        for (int mi = 0; mi < n_margins; ++mi) {
+            double sl = 0.0, sr = 0.0;
+            double margin = margins[mi];
+            split_weights_raw(
+                ctx->X, ctx->n_features, idx, weights, n,
+                cand.feature, cand.threshold, margin, cand.nan_go_left,
+                ctx->candidate_left_w, ctx->candidate_right_w,
+                &sl, &sr);
+            if (sl < ctx->min_samples_leaf || sr < ctx->min_samples_leaf)
+                continue;
+
+            int node_count = 1;
+            CNode *root = &ctx->temp_nodes[0];
+            root->feature = cand.feature;
+            root->threshold = cand.threshold;
+            root->margin = margin;
+            root->left = -1;
+            root->right = -1;
+            root->value = 0.0;
+            root->n_samples = sl + sr;
+            root->impurity_reduction = 0.0;
+            root->nan_go_left = cand.nan_go_left;
+
+            int left_id = build_rollout_regression(
+                ctx, idx, ctx->candidate_left_w, n, 1, &node_count);
+            if (left_id < 0) {
+                free(margins);
+                return -1;
+            }
+            int right_id = build_rollout_regression(
+                ctx, idx, ctx->candidate_right_w, n, 1, &node_count);
+            if (right_id < 0) {
+                free(margins);
+                return -1;
+            }
+            root->left = left_id;
+            root->right = right_id;
+
+            double loss = temp_tree_validation_loss(ctx, 0, val_weights);
+            if (loss < best->imp) {
+                best->imp = loss;
+                best->feature = cand.feature;
+                best->threshold_idx = cand.threshold_idx;
+                best->margin_idx = mi;
+                best->threshold = cand.threshold;
+                best->margin = margin;
+                best->nan_go_left = cand.nan_go_left;
+            }
+        }
+    }
+
+    free(margins);
+    return best->feature >= 0 ? 1 : 0;
+}
+
+static int
+build_lookahead_regression_numeric(
+    LookaheadContext *ctx,
+    const npy_intp *idx,
+    const double *weights,
+    npy_intp n,
+    const double *val_weights,
+    int depth,
+    int max_depth,
+    LookaheadDepthWork *dw,
+    CNode *nodes,
+    int *node_count,
+    int max_nodes)
+{
+    if (*node_count >= max_nodes) return -1;
+
+    int node_id = *node_count;
+    *node_count += 1;
+
+    double eff = 0.0, max_w = 0.0;
+    double value = weighted_mean_indexed(
+        ctx->y, idx, weights, n, &eff, &max_w);
+
+    nodes[node_id].feature = -1;
+    nodes[node_id].threshold = 0.0;
+    nodes[node_id].margin = 0.0;
+    nodes[node_id].left = -1;
+    nodes[node_id].right = -1;
+    nodes[node_id].value = value;
+    nodes[node_id].n_samples = eff;
+    nodes[node_id].impurity_reduction = 0.0;
+    nodes[node_id].nan_go_left = 1;
+
+    if (depth >= max_depth || n < 2 ||
+        eff < 2.0 * ctx->min_samples_leaf) {
+        return node_id;
+    }
+
+    double val_eff = 0.0;
+    for (npy_intp i = 0; i < ctx->n_val; ++i) val_eff += val_weights[i];
+
+    SplitResult best;
+    int found;
+    if (val_eff < ctx->lookahead_min_val) {
+        found = lookahead_scan_regression(
+            ctx, idx, weights, n, depth, 0, &best);
+    } else {
+        found = find_lookahead_split_regression(
+            ctx, idx, weights, n, val_weights, depth, &best);
+        if (found < 0) return -1;
+    }
+    if (!found || best.feature < 0) return node_id;
+
+    if (ctx->margin_cv_folds >= 2) {
+        double cv_margin = best.margin;
+        int cv_status = cv_select_margin_regression(
+            ctx, idx, weights, n, best.feature, best.threshold,
+            best.nan_go_left, depth, &cv_margin);
+        if (cv_status < 0) return -1;
+        if (cv_status > 0) best.margin = cv_margin;
+    }
+
+    LookaheadDepthWork *work = &dw[depth];
+    double sl = 0.0, sr = 0.0;
+    split_weights_raw(
+        ctx->X, ctx->n_features, idx, weights, n,
+        best.feature, best.threshold, best.margin, best.nan_go_left,
+        work->left_w, work->right_w, &sl, &sr);
+
+    double parent_mean = value;
+    double parent_loss = 0.0;
+    for (npy_intp i = 0; i < n; ++i) {
+        double r = ctx->y[idx[i]] - parent_mean;
+        parent_loss += weights[i] * r * r;
+    }
+    parent_loss = eff > 1e-15 ? parent_loss / eff : 0.0;
+    double child_loss = split_child_loss_raw(
+        ctx->y, idx, work->left_w, work->right_w, n, eff);
+
+    double eps = max_w > 0.0 ? 1e-6 * max_w : 1e-10;
+    if (ctx->min_train_weight_fraction > 0.0) {
+        double frac_eps = ctx->min_train_weight_fraction * max_w;
+        if (frac_eps > eps) eps = frac_eps;
+    }
+
+    npy_intp nl = 0, nr = 0;
+    for (npy_intp i = 0; i < n; ++i) {
+        if (work->left_w[i] > eps) {
+            work->left_idx[nl] = idx[i];
+            work->left_w[nl] = work->left_w[i];
+            ++nl;
+        }
+        if (work->right_w[i] > eps) {
+            work->right_idx[nr] = idx[i];
+            work->right_w[nr] = work->right_w[i];
+            ++nr;
+        }
+    }
+    if (nl < 1 || nr < 1) return node_id;
+
+    for (npy_intp i = 0; i < ctx->n_val; ++i) {
+        double x = ctx->Xv[i * ctx->n_features + best.feature];
+        double mu = mu_left_numeric(
+            x, best.threshold, best.margin, best.nan_go_left);
+        work->val_left_w[i] = val_weights[i] * mu;
+        work->val_right_w[i] = val_weights[i] * (1.0 - mu);
+    }
+
+    nodes[node_id].feature = best.feature;
+    nodes[node_id].threshold = best.threshold;
+    nodes[node_id].margin = best.margin;
+    nodes[node_id].impurity_reduction = (parent_loss - child_loss) * eff;
+    nodes[node_id].nan_go_left = best.nan_go_left;
+
+    int left_id = build_lookahead_regression_numeric(
+        ctx, work->left_idx, work->left_w, nl, work->val_left_w,
+        depth + 1, max_depth, dw, nodes, node_count, max_nodes);
+    if (left_id < 0) return -1;
+    int right_id = build_lookahead_regression_numeric(
+        ctx, work->right_idx, work->right_w, nr, work->val_right_w,
+        depth + 1, max_depth, dw, nodes, node_count, max_nodes);
+    if (right_id < 0) return -1;
+
+    nodes[node_id].left = left_id;
+    nodes[node_id].right = right_id;
+    return node_id;
+}
+
+static double
+fill_class_node_summary(
+    LookaheadContext *ctx,
+    const npy_intp *idx,
+    const double *weights,
+    npy_intp n,
+    int node_id,
+    double *eff_out,
+    double *max_weight_out)
+{
+    int K = ctx->n_classes;
+    for (int c = 0; c < K; ++c) ctx->class_left_buf[c] = 0.0;
+
+    double eff = 0.0, max_w = 0.0;
+    for (npy_intp i = 0; i < n; ++i) {
+        double wi = weights[i];
+        int cls = (int)ctx->y[idx[i]];
+        if (cls >= 0 && cls < K) ctx->class_left_buf[cls] += wi;
+        eff += wi;
+        if (wi > max_w) max_w = wi;
+    }
+
+    int best_class = 0;
+    double best_weight = K > 0 ? ctx->class_left_buf[0] : 0.0;
+    for (int c = 1; c < K; ++c) {
+        if (ctx->class_left_buf[c] > best_weight) {
+            best_weight = ctx->class_left_buf[c];
+            best_class = c;
+        }
+    }
+
+    if (ctx->temp_leaf_probs && node_id >= 0 &&
+            node_id < ctx->max_rollout_nodes) {
+        double *p = ctx->temp_leaf_probs + (size_t)node_id * (size_t)K;
+        if (eff > 1e-12) {
+            for (int c = 0; c < K; ++c) p[c] = ctx->class_left_buf[c] / eff;
+        } else {
+            double uniform = K > 0 ? 1.0 / (double)K : 0.0;
+            for (int c = 0; c < K; ++c) p[c] = uniform;
+        }
+    }
+
+    if (eff_out) *eff_out = eff;
+    if (max_weight_out) *max_weight_out = max_w;
+    return (double)best_class;
+}
+
+static double
+split_child_impurity_classifier_raw(
+    LookaheadContext *ctx,
+    const npy_intp *idx,
+    const double *left_w,
+    const double *right_w,
+    npy_intp n,
+    double parent_eff)
+{
+    int K = ctx->n_classes;
+    for (int c = 0; c < K; ++c) {
+        ctx->class_left_buf[c] = 0.0;
+        ctx->class_total_buf[c] = 0.0;
+    }
+
+    double sl = 0.0, sr = 0.0;
+    for (npy_intp i = 0; i < n; ++i) {
+        int cls = (int)ctx->y[idx[i]];
+        if (cls < 0 || cls >= K) continue;
+        double wl = left_w[i];
+        double wr = right_w[i];
+        ctx->class_left_buf[cls] += wl;
+        ctx->class_total_buf[cls] += wl + wr;
+        sl += wl;
+        sr += wr;
+    }
+    if (sl < 1e-15 || sr < 1e-15 || parent_eff < 1e-15) return 0.0;
+
+    double left_imp = class_impurity_from_counts(
+        ctx->class_left_buf, K, sl, ctx->split_criterion);
+    for (int c = 0; c < K; ++c) {
+        ctx->class_total_buf[c] -= ctx->class_left_buf[c];
+    }
+    double right_imp = class_impurity_from_counts(
+        ctx->class_total_buf, K, sr, ctx->split_criterion);
+    return (sl * left_imp + sr * right_imp) / parent_eff;
+}
+
+static int
+build_rollout_classifier(
+    LookaheadContext *ctx,
+    const npy_intp *idx,
+    const double *weights,
+    npy_intp n,
+    int depth,
+    int *node_count)
+{
+    if (*node_count >= ctx->max_rollout_nodes) return -1;
+
+    int node_id = *node_count;
+    *node_count += 1;
+
+    double eff = 0.0, max_w = 0.0;
+    double value = fill_class_node_summary(
+        ctx, idx, weights, n, node_id, &eff, &max_w);
+    (void)max_w;
+
+    CNode *node = &ctx->temp_nodes[node_id];
+    node->feature = -1;
+    node->threshold = 0.0;
+    node->margin = 0.0;
+    node->left = -1;
+    node->right = -1;
+    node->value = value;
+    node->n_samples = eff;
+    node->impurity_reduction = 0.0;
+    node->nan_go_left = 1;
+
+    if (depth >= ctx->lookahead_horizon ||
+        eff < 2.0 * ctx->min_samples_leaf) {
+        return node_id;
+    }
+
+    SplitResult best;
+    if (!lookahead_scan_classifier(ctx, idx, weights, n, depth, 0, &best)) {
+        return node_id;
+    }
+
+    double sl = 0.0, sr = 0.0;
+    double *left_w = ctx->rollout_work[depth].left_w;
+    double *right_w = ctx->rollout_work[depth].right_w;
+    split_weights_raw(
+        ctx->X, ctx->n_features, idx, weights, n,
+        best.feature, best.threshold, best.margin, best.nan_go_left,
+        left_w, right_w, &sl, &sr);
+    if (sl < ctx->min_samples_leaf || sr < ctx->min_samples_leaf) {
+        return node_id;
+    }
+
+    node->feature = best.feature;
+    node->threshold = best.threshold;
+    node->margin = best.margin;
+    node->nan_go_left = best.nan_go_left;
+
+    int left_id = build_rollout_classifier(
+        ctx, idx, left_w, n, depth + 1, node_count);
+    if (left_id < 0) return -1;
+    int right_id = build_rollout_classifier(
+        ctx, idx, right_w, n, depth + 1, node_count);
+    if (right_id < 0) return -1;
+    node->left = left_id;
+    node->right = right_id;
+    return node_id;
+}
+
+static double
+temp_tree_validation_logloss(
+    LookaheadContext *ctx,
+    int root_id,
+    const double *val_weights)
+{
+    int K = ctx->n_classes;
+    double loss = 0.0;
+    double denom = 0.0;
+    double unweighted_loss = 0.0;
+
+    for (npy_intp i = 0; i < ctx->n_val; ++i) {
+        for (int c = 0; c < K; ++c) ctx->temp_pred_probs[c] = 0.0;
+
+        npy_intp top = 0;
+        ctx->temp_stack_nodes[top] = root_id;
+        ctx->temp_stack_weights[top] = 1.0;
+        ++top;
+
+        while (top > 0) {
+            --top;
+            npy_int64 node_idx = ctx->temp_stack_nodes[top];
+            double path_w = ctx->temp_stack_weights[top];
+            CNode *node = &ctx->temp_nodes[node_idx];
+            if (node->left < 0) {
+                double *p = ctx->temp_leaf_probs
+                    + (size_t)node_idx * (size_t)K;
+                for (int c = 0; c < K; ++c)
+                    ctx->temp_pred_probs[c] += path_w * p[c];
+                continue;
+            }
+
+            double x = ctx->Xv[i * ctx->n_features + node->feature];
+            double mu = mu_left_numeric(
+                x, node->threshold, node->margin, node->nan_go_left);
+            if (mu > 0.0) {
+                ctx->temp_stack_nodes[top] = node->left;
+                ctx->temp_stack_weights[top] = path_w * mu;
+                ++top;
+            }
+            if (mu < 1.0) {
+                ctx->temp_stack_nodes[top] = node->right;
+                ctx->temp_stack_weights[top] = path_w * (1.0 - mu);
+                ++top;
+            }
+        }
+
+        int cls = (int)ctx->yv[i];
+        double p = (cls >= 0 && cls < K) ? ctx->temp_pred_probs[cls] : 0.0;
+        if (p < 1e-12) p = 1e-12;
+        if (p > 1.0) p = 1.0;
+        double li = -log(p);
+        double wi = val_weights[i];
+        loss += wi * li;
+        denom += wi;
+        unweighted_loss += li;
+    }
+
+    if (denom > 1e-12) return loss / denom;
+    return ctx->n_val > 0 ? unweighted_loss / (double)ctx->n_val : 0.0;
+}
+
+static int
+find_lookahead_split_classifier(
+    LookaheadContext *ctx,
+    const npy_intp *idx,
+    const double *weights,
+    npy_intp n,
+    const double *val_weights,
+    int depth,
+    SplitResult *best)
+{
+    int n_short = lookahead_scan_classifier(
+        ctx, idx, weights, n, depth, 1, best);
+    if (n_short <= 0) {
+        best->feature = -1;
+        return 0;
+    }
+
+    best->feature = -1;
+    best->threshold_idx = -1;
+    best->margin_idx = -1;
+    best->imp = INFINITY;
+
+    int max_margins = ctx->margin_grid_size + (ctx->include_hard_splits ? 1 : 0);
+    if (max_margins < 1) max_margins = 1;
+    double *margins = (double *)malloc((size_t)max_margins * sizeof(double));
+    if (!margins) return -1;
+
+    for (int ci = 0; ci < n_short; ++ci) {
+        LAThresholdCandidate cand = ctx->shortlist[ci];
+        double feat_std = weighted_std_feature_raw(
+            ctx->X, ctx->n_features, idx, weights, n, cand.feature);
+        int n_margins = build_margin_grid_la(
+            feat_std, depth, ctx->include_hard_splits,
+            ctx->margin_min_scale, ctx->margin_max_scale,
+            ctx->margin_grid_size, ctx->margin_depth_decay,
+            margins);
+
+        for (int mi = 0; mi < n_margins; ++mi) {
+            double sl = 0.0, sr = 0.0;
+            double margin = margins[mi];
+            split_weights_raw(
+                ctx->X, ctx->n_features, idx, weights, n,
+                cand.feature, cand.threshold, margin, cand.nan_go_left,
+                ctx->candidate_left_w, ctx->candidate_right_w,
+                &sl, &sr);
+            if (sl < ctx->min_samples_leaf || sr < ctx->min_samples_leaf)
+                continue;
+
+            int node_count = 1;
+            CNode *root = &ctx->temp_nodes[0];
+            root->feature = cand.feature;
+            root->threshold = cand.threshold;
+            root->margin = margin;
+            root->left = -1;
+            root->right = -1;
+            root->value = 0.0;
+            root->n_samples = sl + sr;
+            root->impurity_reduction = 0.0;
+            root->nan_go_left = cand.nan_go_left;
+
+            int left_id = build_rollout_classifier(
+                ctx, idx, ctx->candidate_left_w, n, 1, &node_count);
+            if (left_id < 0) {
+                free(margins);
+                return -1;
+            }
+            int right_id = build_rollout_classifier(
+                ctx, idx, ctx->candidate_right_w, n, 1, &node_count);
+            if (right_id < 0) {
+                free(margins);
+                return -1;
+            }
+            root->left = left_id;
+            root->right = right_id;
+
+            double loss = temp_tree_validation_logloss(ctx, 0, val_weights);
+            if (loss < best->imp) {
+                best->imp = loss;
+                best->feature = cand.feature;
+                best->threshold_idx = cand.threshold_idx;
+                best->margin_idx = mi;
+                best->threshold = cand.threshold;
+                best->margin = margin;
+                best->nan_go_left = cand.nan_go_left;
+            }
+        }
+    }
+
+    free(margins);
+    return best->feature >= 0 ? 1 : 0;
+}
+
+static int
+build_lookahead_classifier_numeric(
+    LookaheadContext *ctx,
+    const npy_intp *idx,
+    const double *weights,
+    npy_intp n,
+    const double *val_weights,
+    int depth,
+    int max_depth,
+    LookaheadDepthWork *dw,
+    CNode *nodes,
+    int *node_count,
+    int max_nodes)
+{
+    if (*node_count >= max_nodes) return -1;
+
+    int node_id = *node_count;
+    *node_count += 1;
+
+    double eff = 0.0, max_w = 0.0;
+    double value = fill_class_node_summary(
+        ctx, idx, weights, n, node_id, &eff, &max_w);
+
+    nodes[node_id].feature = -1;
+    nodes[node_id].threshold = 0.0;
+    nodes[node_id].margin = 0.0;
+    nodes[node_id].left = -1;
+    nodes[node_id].right = -1;
+    nodes[node_id].value = value;
+    nodes[node_id].n_samples = eff;
+    nodes[node_id].impurity_reduction = 0.0;
+    nodes[node_id].nan_go_left = 1;
+
+    if (depth >= max_depth || n < 2 ||
+        eff < 2.0 * ctx->min_samples_leaf) {
+        return node_id;
+    }
+
+    double val_eff = 0.0;
+    for (npy_intp i = 0; i < ctx->n_val; ++i) val_eff += val_weights[i];
+
+    SplitResult best;
+    int found;
+    if (val_eff < ctx->lookahead_min_val) {
+        found = lookahead_scan_classifier(
+            ctx, idx, weights, n, depth, 0, &best);
+    } else {
+        found = find_lookahead_split_classifier(
+            ctx, idx, weights, n, val_weights, depth, &best);
+        if (found < 0) return -1;
+    }
+    if (!found || best.feature < 0) return node_id;
+
+    if (ctx->margin_cv_folds >= 2) {
+        double cv_margin = best.margin;
+        int cv_status = cv_select_margin_classifier(
+            ctx, idx, weights, n, best.feature, best.threshold,
+            best.nan_go_left, depth, &cv_margin);
+        if (cv_status < 0) return -1;
+        if (cv_status > 0) best.margin = cv_margin;
+    }
+
+    LookaheadDepthWork *work = &dw[depth];
+    double sl = 0.0, sr = 0.0;
+    split_weights_raw(
+        ctx->X, ctx->n_features, idx, weights, n,
+        best.feature, best.threshold, best.margin, best.nan_go_left,
+        work->left_w, work->right_w, &sl, &sr);
+
+    double parent_impurity;
+    {
+        for (int c = 0; c < ctx->n_classes; ++c)
+            ctx->class_total_buf[c] = 0.0;
+        for (npy_intp i = 0; i < n; ++i) {
+            int cls = (int)ctx->y[idx[i]];
+            if (cls >= 0 && cls < ctx->n_classes)
+                ctx->class_total_buf[cls] += weights[i];
+        }
+        parent_impurity = class_impurity_from_counts(
+            ctx->class_total_buf, ctx->n_classes, eff,
+            ctx->split_criterion);
+    }
+    double child_impurity = split_child_impurity_classifier_raw(
+        ctx, idx, work->left_w, work->right_w, n, eff);
+
+    double eps = max_w > 0.0 ? 1e-6 * max_w : 1e-10;
+    if (ctx->min_train_weight_fraction > 0.0) {
+        double frac_eps = ctx->min_train_weight_fraction * max_w;
+        if (frac_eps > eps) eps = frac_eps;
+    }
+
+    npy_intp nl = 0, nr = 0;
+    for (npy_intp i = 0; i < n; ++i) {
+        if (work->left_w[i] > eps) {
+            work->left_idx[nl] = idx[i];
+            work->left_w[nl] = work->left_w[i];
+            ++nl;
+        }
+        if (work->right_w[i] > eps) {
+            work->right_idx[nr] = idx[i];
+            work->right_w[nr] = work->right_w[i];
+            ++nr;
+        }
+    }
+    if (nl < 1 || nr < 1) return node_id;
+
+    for (npy_intp i = 0; i < ctx->n_val; ++i) {
+        double x = ctx->Xv[i * ctx->n_features + best.feature];
+        double mu = mu_left_numeric(
+            x, best.threshold, best.margin, best.nan_go_left);
+        work->val_left_w[i] = val_weights[i] * mu;
+        work->val_right_w[i] = val_weights[i] * (1.0 - mu);
+    }
+
+    nodes[node_id].feature = best.feature;
+    nodes[node_id].threshold = best.threshold;
+    nodes[node_id].margin = best.margin;
+    nodes[node_id].impurity_reduction = (
+        parent_impurity - child_impurity) * eff;
+    nodes[node_id].nan_go_left = best.nan_go_left;
+
+    int left_id = build_lookahead_classifier_numeric(
+        ctx, work->left_idx, work->left_w, nl, work->val_left_w,
+        depth + 1, max_depth, dw, nodes, node_count, max_nodes);
+    if (left_id < 0) return -1;
+    int right_id = build_lookahead_classifier_numeric(
+        ctx, work->right_idx, work->right_w, nr, work->val_right_w,
+        depth + 1, max_depth, dw, nodes, node_count, max_nodes);
+    if (right_id < 0) return -1;
+
+    nodes[node_id].left = left_id;
     nodes[node_id].right = right_id;
     return node_id;
 }
@@ -1248,6 +3230,775 @@ grow_fail:
     return NULL;
 }
 
+static PyObject *
+grow_lookahead_regression(PyObject *self, PyObject *args)
+{
+    PyObject *X_obj, *X_bins_obj, *y_obj, *w_obj;
+    PyObject *Xv_obj, *yv_obj, *wv_obj;
+    PyObject *thresholds_obj, *centers_obj, *n_thresholds_obj;
+    int max_depth, margin_grid_size, include_hard_splits;
+    int lookahead_horizon, lookahead_candidates;
+    int margin_cv_folds, margin_cv_repeats;
+    unsigned long cv_seed;
+    double min_samples_leaf, margin_min_scale, margin_max_scale;
+    double margin_depth_decay, min_train_weight_fraction, lookahead_min_val;
+
+    if (!PyArg_ParseTuple(args, "OOOOOOOOOOididdpddiidiik",
+                          &X_obj, &X_bins_obj, &y_obj, &w_obj,
+                          &Xv_obj, &yv_obj, &wv_obj,
+                          &thresholds_obj, &centers_obj, &n_thresholds_obj,
+                          &max_depth, &min_samples_leaf, &margin_grid_size,
+                          &margin_min_scale, &margin_max_scale,
+                          &include_hard_splits, &margin_depth_decay,
+                          &min_train_weight_fraction, &lookahead_horizon,
+                          &lookahead_candidates, &lookahead_min_val,
+                          &margin_cv_folds, &margin_cv_repeats, &cv_seed))
+        return NULL;
+
+    PyArrayObject *X_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        X_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *X_bins_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        X_bins_obj, NPY_INT32, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *y_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        y_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *w_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        w_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *Xv_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        Xv_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *yv_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        yv_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *wv_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        wv_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *thresholds_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        thresholds_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *centers_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        centers_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *n_thresholds_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        n_thresholds_obj, NPY_INT32, NPY_ARRAY_IN_ARRAY);
+
+    if (!X_arr || !X_bins_arr || !y_arr || !w_arr || !Xv_arr ||
+        !yv_arr || !wv_arr || !thresholds_arr || !centers_arr ||
+        !n_thresholds_arr) {
+        Py_XDECREF(X_arr); Py_XDECREF(X_bins_arr); Py_XDECREF(y_arr);
+        Py_XDECREF(w_arr); Py_XDECREF(Xv_arr); Py_XDECREF(yv_arr);
+        Py_XDECREF(wv_arr); Py_XDECREF(thresholds_arr);
+        Py_XDECREF(centers_arr); Py_XDECREF(n_thresholds_arr);
+        return NULL;
+    }
+
+    if (PyArray_NDIM(X_arr) != 2 || PyArray_NDIM(X_bins_arr) != 2 ||
+        PyArray_NDIM(Xv_arr) != 2 ||
+        PyArray_NDIM(thresholds_arr) != 2 ||
+        PyArray_NDIM(centers_arr) != 2) {
+        PyErr_SetString(PyExc_ValueError,
+            "X, X_bins, X_val, thresholds, and centers must be 2D");
+        goto la_grow_fail;
+    }
+
+    {
+        npy_intp n_train = PyArray_DIM(X_arr, 0);
+        npy_intp n_features = PyArray_DIM(X_arr, 1);
+        npy_intp n_val = PyArray_DIM(Xv_arr, 0);
+
+        if (PyArray_DIM(X_bins_arr, 0) != n_train ||
+            PyArray_DIM(X_bins_arr, 1) != n_features ||
+            PyArray_DIM(Xv_arr, 1) != n_features ||
+            PyArray_SIZE(y_arr) != n_train ||
+            PyArray_SIZE(w_arr) != n_train ||
+            PyArray_SIZE(yv_arr) != n_val ||
+            PyArray_SIZE(wv_arr) != n_val ||
+            PyArray_DIM(thresholds_arr, 0) != n_features ||
+            PyArray_DIM(centers_arr, 0) != n_features ||
+            PyArray_SIZE(n_thresholds_arr) != n_features) {
+            PyErr_SetString(PyExc_ValueError,
+                            "input array dimensions do not match");
+            goto la_grow_fail;
+        }
+
+        int max_thresholds = (int)PyArray_DIM(thresholds_arr, 1);
+        if (PyArray_DIM(centers_arr, 1) != max_thresholds + 1) {
+            PyErr_SetString(PyExc_ValueError,
+                            "centers width must equal thresholds width + 1");
+            goto la_grow_fail;
+        }
+        if (max_depth < 0 || max_depth > 20 ||
+            lookahead_horizon < 1 || lookahead_horizon > 16 ||
+            margin_grid_size < 1 || lookahead_candidates < 1 ||
+            (margin_cv_folds != 0 && margin_cv_folds < 2) ||
+            margin_cv_repeats < 1 ||
+            n_features > (npy_intp)INT_MAX ||
+            max_thresholds > INT_MAX - 2) {
+            PyErr_SetString(PyExc_ValueError,
+                            "invalid lookahead grower parameter");
+            goto la_grow_fail;
+        }
+
+        int max_nodes = (1 << (max_depth + 1)) - 1;
+        int max_rollout_nodes = (1 << (lookahead_horizon + 1)) - 1;
+        int n_dw = max_depth > 0 ? max_depth : 1;
+        int n_roll = lookahead_horizon + 1;
+        int B_stride = max_thresholds + 1;
+        int max_margins = margin_grid_size + (include_hard_splits ? 1 : 0) + 1;
+
+        CNode *nodes = (CNode *)calloc((size_t)max_nodes, sizeof(CNode));
+        npy_intp *idx = (npy_intp *)malloc(
+            (size_t)n_train * sizeof(npy_intp));
+        LookaheadDepthWork *dw = (LookaheadDepthWork *)calloc(
+            (size_t)n_dw, sizeof(LookaheadDepthWork));
+        LookaheadRolloutWork *rollout_work = (LookaheadRolloutWork *)calloc(
+            (size_t)n_roll, sizeof(LookaheadRolloutWork));
+
+        double *margin_buf = (double *)malloc(
+            (size_t)max_margins * sizeof(double));
+        double *hist_buf = (double *)malloc(
+            (size_t)n_features * 3 * (size_t)B_stride * sizeof(double));
+        double *nan_buf = (double *)malloc(
+            (size_t)n_features * 3 * sizeof(double));
+        double *xstat_buf = (double *)malloc(
+            (size_t)n_features * 3 * sizeof(double));
+        int *int_scratch = (int *)malloc(
+            (size_t)n_features * 5 * sizeof(int));
+        LAThresholdCandidate *shortlist = (LAThresholdCandidate *)malloc(
+            (size_t)lookahead_candidates * sizeof(LAThresholdCandidate));
+        double *candidate_left_w = (double *)malloc(
+            (size_t)n_train * sizeof(double));
+        double *candidate_right_w = (double *)malloc(
+            (size_t)n_train * sizeof(double));
+        CNode *temp_nodes = (CNode *)calloc(
+            (size_t)max_rollout_nodes, sizeof(CNode));
+        npy_int64 *temp_stack_nodes = (npy_int64 *)malloc(
+            (size_t)max_rollout_nodes * sizeof(npy_int64));
+        double *temp_stack_weights = (double *)malloc(
+            (size_t)max_rollout_nodes * sizeof(double));
+        npy_intp *cv_perm = (npy_intp *)malloc(
+            (size_t)n_train * sizeof(npy_intp));
+        int *cv_fold_ids = (int *)malloc(
+            (size_t)n_train * sizeof(int));
+        double *cv_mu_buf = (double *)malloc(
+            (size_t)max_margins * (size_t)n_train * sizeof(double));
+        double *cv_losses = (double *)malloc(
+            (size_t)max_margins * sizeof(double));
+        unsigned char *cv_valid = (unsigned char *)malloc(
+            (size_t)max_margins * sizeof(unsigned char));
+
+        if (!nodes || !idx || !dw || !rollout_work || !margin_buf ||
+            !hist_buf || !nan_buf || !xstat_buf || !int_scratch ||
+            !shortlist || !candidate_left_w || !candidate_right_w ||
+            !temp_nodes || !temp_stack_nodes || !temp_stack_weights ||
+            !cv_perm || !cv_fold_ids || !cv_mu_buf ||
+            !cv_losses || !cv_valid) {
+            PyErr_NoMemory();
+            free(nodes); free(idx); free(dw); free(rollout_work);
+            free(margin_buf); free(hist_buf); free(nan_buf);
+            free(xstat_buf); free(int_scratch); free(shortlist);
+            free(candidate_left_w); free(candidate_right_w);
+            free(temp_nodes); free(temp_stack_nodes); free(temp_stack_weights);
+            free(cv_perm); free(cv_fold_ids); free(cv_mu_buf);
+            free(cv_losses); free(cv_valid);
+            goto la_grow_fail;
+        }
+
+        int alloc_ok = 1;
+        for (int d = 0; d < n_dw && alloc_ok; ++d) {
+            dw[d].left_idx = (npy_intp *)malloc(
+                (size_t)n_train * sizeof(npy_intp));
+            dw[d].right_idx = (npy_intp *)malloc(
+                (size_t)n_train * sizeof(npy_intp));
+            dw[d].left_w = (double *)malloc(
+                (size_t)n_train * sizeof(double));
+            dw[d].right_w = (double *)malloc(
+                (size_t)n_train * sizeof(double));
+            dw[d].val_left_w = (double *)malloc(
+                (size_t)n_val * sizeof(double));
+            dw[d].val_right_w = (double *)malloc(
+                (size_t)n_val * sizeof(double));
+            if (!dw[d].left_idx || !dw[d].right_idx ||
+                !dw[d].left_w || !dw[d].right_w ||
+                !dw[d].val_left_w || !dw[d].val_right_w)
+                alloc_ok = 0;
+        }
+        for (int d = 0; d < n_roll && alloc_ok; ++d) {
+            rollout_work[d].left_w = (double *)malloc(
+                (size_t)n_train * sizeof(double));
+            rollout_work[d].right_w = (double *)malloc(
+                (size_t)n_train * sizeof(double));
+            if (!rollout_work[d].left_w || !rollout_work[d].right_w)
+                alloc_ok = 0;
+        }
+        if (!alloc_ok) {
+            PyErr_NoMemory();
+            for (int d = 0; d < n_dw; ++d) {
+                free(dw[d].left_idx); free(dw[d].right_idx);
+                free(dw[d].left_w); free(dw[d].right_w);
+                free(dw[d].val_left_w); free(dw[d].val_right_w);
+            }
+            for (int d = 0; d < n_roll; ++d) {
+                free(rollout_work[d].left_w);
+                free(rollout_work[d].right_w);
+            }
+            free(nodes); free(idx); free(dw); free(rollout_work);
+            free(margin_buf); free(hist_buf); free(nan_buf);
+            free(xstat_buf); free(int_scratch); free(shortlist);
+            free(candidate_left_w); free(candidate_right_w);
+            free(temp_nodes); free(temp_stack_nodes); free(temp_stack_weights);
+            free(cv_perm); free(cv_fold_ids); free(cv_mu_buf);
+            free(cv_losses); free(cv_valid);
+            goto la_grow_fail;
+        }
+
+        for (npy_intp i = 0; i < n_train; ++i) idx[i] = i;
+
+        LookaheadContext ctx;
+        ctx.X = (double *)PyArray_DATA(X_arr);
+        ctx.X_bins = (int *)PyArray_DATA(X_bins_arr);
+        ctx.y = (double *)PyArray_DATA(y_arr);
+        ctx.Xv = (double *)PyArray_DATA(Xv_arr);
+        ctx.yv = (double *)PyArray_DATA(yv_arr);
+        ctx.n_features = n_features;
+        ctx.n_val = n_val;
+        ctx.thresholds_flat = (double *)PyArray_DATA(thresholds_arr);
+        ctx.centers_flat = (double *)PyArray_DATA(centers_arr);
+        ctx.n_thresholds = (int *)PyArray_DATA(n_thresholds_arr);
+        ctx.max_thresholds = max_thresholds;
+        ctx.margin_grid_size = margin_grid_size;
+        ctx.include_hard_splits = include_hard_splits ? 1 : 0;
+        ctx.margin_min_scale = margin_min_scale;
+        ctx.margin_max_scale = margin_max_scale;
+        ctx.margin_depth_decay = margin_depth_decay;
+        ctx.min_samples_leaf = min_samples_leaf;
+        ctx.min_train_weight_fraction = min_train_weight_fraction;
+        ctx.lookahead_horizon = lookahead_horizon;
+        ctx.lookahead_candidates = lookahead_candidates;
+        ctx.lookahead_min_val = lookahead_min_val;
+        ctx.margin_cv_folds = margin_cv_folds;
+        ctx.margin_cv_repeats = margin_cv_repeats;
+        ctx.cv_rng_state = ((uint64_t)cv_seed + 1ULL)
+            ^ 0x9e3779b97f4a7c15ULL;
+        ctx.prefix_buf = NULL;
+        ctx.margin_buf = margin_buf;
+        ctx.hist_buf = hist_buf;
+        ctx.nan_buf = nan_buf;
+        ctx.xstat_buf = xstat_buf;
+        ctx.int_scratch = int_scratch;
+        ctx.shortlist = shortlist;
+        ctx.candidate_left_w = candidate_left_w;
+        ctx.candidate_right_w = candidate_right_w;
+        ctx.rollout_work = rollout_work;
+        ctx.temp_nodes = temp_nodes;
+        ctx.temp_stack_nodes = temp_stack_nodes;
+        ctx.temp_stack_weights = temp_stack_weights;
+        ctx.max_rollout_nodes = max_rollout_nodes;
+        ctx.cv_perm = cv_perm;
+        ctx.cv_fold_ids = cv_fold_ids;
+        ctx.cv_mu_buf = cv_mu_buf;
+        ctx.cv_losses = cv_losses;
+        ctx.cv_valid = cv_valid;
+        ctx.cv_class_left = NULL;
+        ctx.cv_class_right = NULL;
+
+        int node_count = 0;
+        int status = 0;
+        Py_BEGIN_ALLOW_THREADS
+        status = build_lookahead_regression_numeric(
+            &ctx, idx, (double *)PyArray_DATA(w_arr), n_train,
+            (double *)PyArray_DATA(wv_arr), 0, max_depth, dw,
+            nodes, &node_count, max_nodes);
+        Py_END_ALLOW_THREADS
+
+        for (int d = 0; d < n_dw; ++d) {
+            free(dw[d].left_idx); free(dw[d].right_idx);
+            free(dw[d].left_w); free(dw[d].right_w);
+            free(dw[d].val_left_w); free(dw[d].val_right_w);
+        }
+        for (int d = 0; d < n_roll; ++d) {
+            free(rollout_work[d].left_w);
+            free(rollout_work[d].right_w);
+        }
+        free(idx); free(dw); free(rollout_work);
+        free(margin_buf); free(hist_buf); free(nan_buf);
+        free(xstat_buf); free(int_scratch); free(shortlist);
+        free(candidate_left_w); free(candidate_right_w);
+        free(temp_nodes); free(temp_stack_nodes); free(temp_stack_weights);
+        free(cv_perm); free(cv_fold_ids); free(cv_mu_buf);
+        free(cv_losses); free(cv_valid);
+
+        if (status < 0) {
+            free(nodes);
+            PyErr_SetString(PyExc_RuntimeError,
+                            "C lookahead tree grower failed");
+            goto la_grow_fail;
+        }
+
+        npy_intp dims[1] = {node_count};
+        PyArrayObject *features_arr2   = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_INT64);
+        PyArrayObject *node_thr_arr    = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+        PyArrayObject *margins_arr2    = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+        PyArrayObject *lefts_arr2      = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_INT64);
+        PyArrayObject *rights_arr2     = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_INT64);
+        PyArrayObject *values_arr2     = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+        PyArrayObject *n_samples_arr2  = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+        PyArrayObject *imps_arr2       = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+        PyArrayObject *nan_left_arr2   = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_BOOL);
+
+        if (!features_arr2 || !node_thr_arr || !margins_arr2 ||
+            !lefts_arr2    || !rights_arr2  || !values_arr2  ||
+            !n_samples_arr2|| !imps_arr2    || !nan_left_arr2) {
+            Py_XDECREF(features_arr2); Py_XDECREF(node_thr_arr);
+            Py_XDECREF(margins_arr2);  Py_XDECREF(lefts_arr2);
+            Py_XDECREF(rights_arr2);   Py_XDECREF(values_arr2);
+            Py_XDECREF(n_samples_arr2);Py_XDECREF(imps_arr2);
+            Py_XDECREF(nan_left_arr2);
+            free(nodes);
+            goto la_grow_fail;
+        }
+
+        npy_int64 *features_out  = (npy_int64 *)PyArray_DATA(features_arr2);
+        double    *thr_out       = (double    *)PyArray_DATA(node_thr_arr);
+        double    *margins_out   = (double    *)PyArray_DATA(margins_arr2);
+        npy_int64 *lefts_out     = (npy_int64 *)PyArray_DATA(lefts_arr2);
+        npy_int64 *rights_out    = (npy_int64 *)PyArray_DATA(rights_arr2);
+        double    *values_out    = (double    *)PyArray_DATA(values_arr2);
+        double    *samples_out   = (double    *)PyArray_DATA(n_samples_arr2);
+        double    *imps_out      = (double    *)PyArray_DATA(imps_arr2);
+        npy_bool  *nan_left_out  = (npy_bool  *)PyArray_DATA(nan_left_arr2);
+
+        for (int i = 0; i < node_count; ++i) {
+            features_out[i] = nodes[i].feature;
+            thr_out[i]      = nodes[i].threshold;
+            margins_out[i]  = nodes[i].margin;
+            lefts_out[i]    = nodes[i].left;
+            rights_out[i]   = nodes[i].right;
+            values_out[i]   = nodes[i].value;
+            samples_out[i]  = nodes[i].n_samples;
+            imps_out[i]     = nodes[i].impurity_reduction;
+            nan_left_out[i] = nodes[i].nan_go_left ? 1 : 0;
+        }
+        free(nodes);
+
+        Py_DECREF(X_arr); Py_DECREF(X_bins_arr); Py_DECREF(y_arr);
+        Py_DECREF(w_arr); Py_DECREF(Xv_arr); Py_DECREF(yv_arr);
+        Py_DECREF(wv_arr); Py_DECREF(thresholds_arr);
+        Py_DECREF(centers_arr); Py_DECREF(n_thresholds_arr);
+
+        return Py_BuildValue("NNNNNNNNN",
+            (PyObject *)features_arr2, (PyObject *)node_thr_arr,
+            (PyObject *)margins_arr2,  (PyObject *)lefts_arr2,
+            (PyObject *)rights_arr2,   (PyObject *)values_arr2,
+            (PyObject *)n_samples_arr2,(PyObject *)imps_arr2,
+            (PyObject *)nan_left_arr2);
+    }
+
+la_grow_fail:
+    Py_XDECREF(X_arr); Py_XDECREF(X_bins_arr); Py_XDECREF(y_arr);
+    Py_XDECREF(w_arr); Py_XDECREF(Xv_arr); Py_XDECREF(yv_arr);
+    Py_XDECREF(wv_arr); Py_XDECREF(thresholds_arr);
+    Py_XDECREF(centers_arr); Py_XDECREF(n_thresholds_arr);
+    return NULL;
+}
+
+static PyObject *
+grow_lookahead_classifier(PyObject *self, PyObject *args)
+{
+    PyObject *X_obj, *X_bins_obj, *y_obj, *w_obj;
+    PyObject *Xv_obj, *yv_obj, *wv_obj;
+    PyObject *thresholds_obj, *centers_obj, *n_thresholds_obj;
+    int max_depth, margin_grid_size, include_hard_splits;
+    int lookahead_horizon, lookahead_candidates;
+    int margin_cv_folds, margin_cv_repeats;
+    int n_classes, split_criterion;
+    unsigned long cv_seed;
+    double min_samples_leaf, margin_min_scale, margin_max_scale;
+    double margin_depth_decay, min_train_weight_fraction, lookahead_min_val;
+
+    if (!PyArg_ParseTuple(args, "OOOOOOOOOOididdpddiidiikii",
+                          &X_obj, &X_bins_obj, &y_obj, &w_obj,
+                          &Xv_obj, &yv_obj, &wv_obj,
+                          &thresholds_obj, &centers_obj, &n_thresholds_obj,
+                          &max_depth, &min_samples_leaf, &margin_grid_size,
+                          &margin_min_scale, &margin_max_scale,
+                          &include_hard_splits, &margin_depth_decay,
+                          &min_train_weight_fraction, &lookahead_horizon,
+                          &lookahead_candidates, &lookahead_min_val,
+                          &margin_cv_folds, &margin_cv_repeats, &cv_seed,
+                          &n_classes, &split_criterion))
+        return NULL;
+
+    PyArrayObject *X_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        X_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *X_bins_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        X_bins_obj, NPY_INT32, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *y_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        y_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *w_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        w_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *Xv_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        Xv_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *yv_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        yv_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *wv_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        wv_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *thresholds_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        thresholds_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *centers_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        centers_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    PyArrayObject *n_thresholds_arr = (PyArrayObject *)PyArray_FROM_OTF(
+        n_thresholds_obj, NPY_INT32, NPY_ARRAY_IN_ARRAY);
+
+    if (!X_arr || !X_bins_arr || !y_arr || !w_arr || !Xv_arr ||
+        !yv_arr || !wv_arr || !thresholds_arr || !centers_arr ||
+        !n_thresholds_arr) {
+        Py_XDECREF(X_arr); Py_XDECREF(X_bins_arr); Py_XDECREF(y_arr);
+        Py_XDECREF(w_arr); Py_XDECREF(Xv_arr); Py_XDECREF(yv_arr);
+        Py_XDECREF(wv_arr); Py_XDECREF(thresholds_arr);
+        Py_XDECREF(centers_arr); Py_XDECREF(n_thresholds_arr);
+        return NULL;
+    }
+
+    if (PyArray_NDIM(X_arr) != 2 || PyArray_NDIM(X_bins_arr) != 2 ||
+        PyArray_NDIM(Xv_arr) != 2 ||
+        PyArray_NDIM(thresholds_arr) != 2 ||
+        PyArray_NDIM(centers_arr) != 2) {
+        PyErr_SetString(PyExc_ValueError,
+            "X, X_bins, X_val, thresholds, and centers must be 2D");
+        goto cla_grow_fail;
+    }
+
+    {
+        npy_intp n_train = PyArray_DIM(X_arr, 0);
+        npy_intp n_features = PyArray_DIM(X_arr, 1);
+        npy_intp n_val = PyArray_DIM(Xv_arr, 0);
+
+        if (PyArray_DIM(X_bins_arr, 0) != n_train ||
+            PyArray_DIM(X_bins_arr, 1) != n_features ||
+            PyArray_DIM(Xv_arr, 1) != n_features ||
+            PyArray_SIZE(y_arr) != n_train ||
+            PyArray_SIZE(w_arr) != n_train ||
+            PyArray_SIZE(yv_arr) != n_val ||
+            PyArray_SIZE(wv_arr) != n_val ||
+            PyArray_DIM(thresholds_arr, 0) != n_features ||
+            PyArray_DIM(centers_arr, 0) != n_features ||
+            PyArray_SIZE(n_thresholds_arr) != n_features) {
+            PyErr_SetString(PyExc_ValueError,
+                            "input array dimensions do not match");
+            goto cla_grow_fail;
+        }
+
+        int max_thresholds = (int)PyArray_DIM(thresholds_arr, 1);
+        if (PyArray_DIM(centers_arr, 1) != max_thresholds + 1) {
+            PyErr_SetString(PyExc_ValueError,
+                            "centers width must equal thresholds width + 1");
+            goto cla_grow_fail;
+        }
+        if (max_depth < 0 || max_depth > 20 ||
+            lookahead_horizon < 1 || lookahead_horizon > 16 ||
+            margin_grid_size < 1 || lookahead_candidates < 1 ||
+            (margin_cv_folds != 0 && margin_cv_folds < 2) ||
+            margin_cv_repeats < 1 ||
+            n_features > (npy_intp)INT_MAX ||
+            max_thresholds > INT_MAX - 2 ||
+            n_classes < 2 || n_classes > 4096 ||
+            (split_criterion != 0 && split_criterion != 1)) {
+            PyErr_SetString(PyExc_ValueError,
+                            "invalid classifier lookahead grower parameter");
+            goto cla_grow_fail;
+        }
+
+        int max_nodes = (1 << (max_depth + 1)) - 1;
+        int max_rollout_nodes = (1 << (lookahead_horizon + 1)) - 1;
+        int n_dw = max_depth > 0 ? max_depth : 1;
+        int n_roll = lookahead_horizon + 1;
+        int B_stride = max_thresholds + 1;
+        int max_margins = margin_grid_size + (include_hard_splits ? 1 : 0) + 1;
+
+        CNode *nodes = (CNode *)calloc((size_t)max_nodes, sizeof(CNode));
+        npy_intp *idx = (npy_intp *)malloc(
+            (size_t)n_train * sizeof(npy_intp));
+        LookaheadDepthWork *dw = (LookaheadDepthWork *)calloc(
+            (size_t)n_dw, sizeof(LookaheadDepthWork));
+        LookaheadRolloutWork *rollout_work = (LookaheadRolloutWork *)calloc(
+            (size_t)n_roll, sizeof(LookaheadRolloutWork));
+
+        double *margin_buf = (double *)malloc(
+            (size_t)max_margins * sizeof(double));
+        double *class_hist_buf = (double *)malloc(
+            (size_t)n_features * (size_t)B_stride * (size_t)n_classes
+            * sizeof(double));
+        double *nan_class_buf = (double *)malloc(
+            (size_t)n_features * (size_t)n_classes * sizeof(double));
+        double *xstat_buf = (double *)malloc(
+            (size_t)n_features * 3 * sizeof(double));
+        double *class_left_buf = (double *)malloc(
+            (size_t)n_classes * sizeof(double));
+        double *class_total_buf = (double *)malloc(
+            (size_t)n_classes * sizeof(double));
+        int *int_scratch = (int *)malloc(
+            (size_t)n_features * 5 * sizeof(int));
+        LAThresholdCandidate *shortlist = (LAThresholdCandidate *)malloc(
+            (size_t)lookahead_candidates * sizeof(LAThresholdCandidate));
+        double *candidate_left_w = (double *)malloc(
+            (size_t)n_train * sizeof(double));
+        double *candidate_right_w = (double *)malloc(
+            (size_t)n_train * sizeof(double));
+        CNode *temp_nodes = (CNode *)calloc(
+            (size_t)max_rollout_nodes, sizeof(CNode));
+        double *temp_leaf_probs = (double *)calloc(
+            (size_t)max_rollout_nodes * (size_t)n_classes,
+            sizeof(double));
+        double *temp_pred_probs = (double *)malloc(
+            (size_t)n_classes * sizeof(double));
+        npy_int64 *temp_stack_nodes = (npy_int64 *)malloc(
+            (size_t)max_rollout_nodes * sizeof(npy_int64));
+        double *temp_stack_weights = (double *)malloc(
+            (size_t)max_rollout_nodes * sizeof(double));
+        npy_intp *cv_perm = (npy_intp *)malloc(
+            (size_t)n_train * sizeof(npy_intp));
+        int *cv_fold_ids = (int *)malloc(
+            (size_t)n_train * sizeof(int));
+        double *cv_mu_buf = (double *)malloc(
+            (size_t)max_margins * (size_t)n_train * sizeof(double));
+        double *cv_losses = (double *)malloc(
+            (size_t)max_margins * sizeof(double));
+        unsigned char *cv_valid = (unsigned char *)malloc(
+            (size_t)max_margins * sizeof(unsigned char));
+        double *cv_class_left = (double *)malloc(
+            (size_t)n_classes * sizeof(double));
+        double *cv_class_right = (double *)malloc(
+            (size_t)n_classes * sizeof(double));
+
+        if (!nodes || !idx || !dw || !rollout_work || !margin_buf ||
+            !class_hist_buf || !nan_class_buf || !xstat_buf ||
+            !class_left_buf || !class_total_buf || !int_scratch ||
+            !shortlist || !candidate_left_w || !candidate_right_w ||
+            !temp_nodes || !temp_leaf_probs || !temp_pred_probs ||
+            !temp_stack_nodes || !temp_stack_weights ||
+            !cv_perm || !cv_fold_ids || !cv_mu_buf || !cv_losses ||
+            !cv_valid || !cv_class_left || !cv_class_right) {
+            PyErr_NoMemory();
+            free(nodes); free(idx); free(dw); free(rollout_work);
+            free(margin_buf); free(class_hist_buf); free(nan_class_buf);
+            free(xstat_buf); free(class_left_buf); free(class_total_buf);
+            free(int_scratch); free(shortlist); free(candidate_left_w);
+            free(candidate_right_w); free(temp_nodes);
+            free(temp_leaf_probs); free(temp_pred_probs);
+            free(temp_stack_nodes); free(temp_stack_weights);
+            free(cv_perm); free(cv_fold_ids); free(cv_mu_buf);
+            free(cv_losses); free(cv_valid);
+            free(cv_class_left); free(cv_class_right);
+            goto cla_grow_fail;
+        }
+
+        int alloc_ok = 1;
+        for (int d = 0; d < n_dw && alloc_ok; ++d) {
+            dw[d].left_idx = (npy_intp *)malloc(
+                (size_t)n_train * sizeof(npy_intp));
+            dw[d].right_idx = (npy_intp *)malloc(
+                (size_t)n_train * sizeof(npy_intp));
+            dw[d].left_w = (double *)malloc(
+                (size_t)n_train * sizeof(double));
+            dw[d].right_w = (double *)malloc(
+                (size_t)n_train * sizeof(double));
+            dw[d].val_left_w = (double *)malloc(
+                (size_t)n_val * sizeof(double));
+            dw[d].val_right_w = (double *)malloc(
+                (size_t)n_val * sizeof(double));
+            if (!dw[d].left_idx || !dw[d].right_idx ||
+                !dw[d].left_w || !dw[d].right_w ||
+                !dw[d].val_left_w || !dw[d].val_right_w)
+                alloc_ok = 0;
+        }
+        for (int d = 0; d < n_roll && alloc_ok; ++d) {
+            rollout_work[d].left_w = (double *)malloc(
+                (size_t)n_train * sizeof(double));
+            rollout_work[d].right_w = (double *)malloc(
+                (size_t)n_train * sizeof(double));
+            if (!rollout_work[d].left_w || !rollout_work[d].right_w)
+                alloc_ok = 0;
+        }
+        if (!alloc_ok) {
+            PyErr_NoMemory();
+            for (int d = 0; d < n_dw; ++d) {
+                free(dw[d].left_idx); free(dw[d].right_idx);
+                free(dw[d].left_w); free(dw[d].right_w);
+                free(dw[d].val_left_w); free(dw[d].val_right_w);
+            }
+            for (int d = 0; d < n_roll; ++d) {
+                free(rollout_work[d].left_w);
+                free(rollout_work[d].right_w);
+            }
+            free(nodes); free(idx); free(dw); free(rollout_work);
+            free(margin_buf); free(class_hist_buf); free(nan_class_buf);
+            free(xstat_buf); free(class_left_buf); free(class_total_buf);
+            free(int_scratch); free(shortlist); free(candidate_left_w);
+            free(candidate_right_w); free(temp_nodes);
+            free(temp_leaf_probs); free(temp_pred_probs);
+            free(temp_stack_nodes); free(temp_stack_weights);
+            free(cv_perm); free(cv_fold_ids); free(cv_mu_buf);
+            free(cv_losses); free(cv_valid);
+            free(cv_class_left); free(cv_class_right);
+            goto cla_grow_fail;
+        }
+
+        for (npy_intp i = 0; i < n_train; ++i) idx[i] = i;
+
+        LookaheadContext ctx;
+        ctx.X = (double *)PyArray_DATA(X_arr);
+        ctx.X_bins = (int *)PyArray_DATA(X_bins_arr);
+        ctx.y = (double *)PyArray_DATA(y_arr);
+        ctx.Xv = (double *)PyArray_DATA(Xv_arr);
+        ctx.yv = (double *)PyArray_DATA(yv_arr);
+        ctx.n_features = n_features;
+        ctx.n_val = n_val;
+        ctx.thresholds_flat = (double *)PyArray_DATA(thresholds_arr);
+        ctx.centers_flat = (double *)PyArray_DATA(centers_arr);
+        ctx.n_thresholds = (int *)PyArray_DATA(n_thresholds_arr);
+        ctx.max_thresholds = max_thresholds;
+        ctx.margin_grid_size = margin_grid_size;
+        ctx.include_hard_splits = include_hard_splits ? 1 : 0;
+        ctx.margin_min_scale = margin_min_scale;
+        ctx.margin_max_scale = margin_max_scale;
+        ctx.margin_depth_decay = margin_depth_decay;
+        ctx.min_samples_leaf = min_samples_leaf;
+        ctx.min_train_weight_fraction = min_train_weight_fraction;
+        ctx.lookahead_horizon = lookahead_horizon;
+        ctx.lookahead_candidates = lookahead_candidates;
+        ctx.lookahead_min_val = lookahead_min_val;
+        ctx.margin_cv_folds = margin_cv_folds;
+        ctx.margin_cv_repeats = margin_cv_repeats;
+        ctx.cv_rng_state = ((uint64_t)cv_seed + 1ULL)
+            ^ 0x9e3779b97f4a7c15ULL;
+        ctx.n_classes = n_classes;
+        ctx.split_criterion = split_criterion;
+        ctx.prefix_buf = NULL;
+        ctx.margin_buf = margin_buf;
+        ctx.hist_buf = NULL;
+        ctx.nan_buf = NULL;
+        ctx.xstat_buf = xstat_buf;
+        ctx.class_hist_buf = class_hist_buf;
+        ctx.nan_class_buf = nan_class_buf;
+        ctx.class_left_buf = class_left_buf;
+        ctx.class_total_buf = class_total_buf;
+        ctx.int_scratch = int_scratch;
+        ctx.shortlist = shortlist;
+        ctx.candidate_left_w = candidate_left_w;
+        ctx.candidate_right_w = candidate_right_w;
+        ctx.rollout_work = rollout_work;
+        ctx.temp_nodes = temp_nodes;
+        ctx.temp_leaf_probs = temp_leaf_probs;
+        ctx.temp_pred_probs = temp_pred_probs;
+        ctx.temp_stack_nodes = temp_stack_nodes;
+        ctx.temp_stack_weights = temp_stack_weights;
+        ctx.max_rollout_nodes = max_rollout_nodes;
+        ctx.cv_perm = cv_perm;
+        ctx.cv_fold_ids = cv_fold_ids;
+        ctx.cv_mu_buf = cv_mu_buf;
+        ctx.cv_losses = cv_losses;
+        ctx.cv_valid = cv_valid;
+        ctx.cv_class_left = cv_class_left;
+        ctx.cv_class_right = cv_class_right;
+
+        int node_count = 0;
+        int status = 0;
+        Py_BEGIN_ALLOW_THREADS
+        status = build_lookahead_classifier_numeric(
+            &ctx, idx, (double *)PyArray_DATA(w_arr), n_train,
+            (double *)PyArray_DATA(wv_arr), 0, max_depth, dw,
+            nodes, &node_count, max_nodes);
+        Py_END_ALLOW_THREADS
+
+        for (int d = 0; d < n_dw; ++d) {
+            free(dw[d].left_idx); free(dw[d].right_idx);
+            free(dw[d].left_w); free(dw[d].right_w);
+            free(dw[d].val_left_w); free(dw[d].val_right_w);
+        }
+        for (int d = 0; d < n_roll; ++d) {
+            free(rollout_work[d].left_w);
+            free(rollout_work[d].right_w);
+        }
+        free(idx); free(dw); free(rollout_work);
+        free(margin_buf); free(class_hist_buf); free(nan_class_buf);
+        free(xstat_buf); free(class_left_buf); free(class_total_buf);
+        free(int_scratch); free(shortlist); free(candidate_left_w);
+        free(candidate_right_w); free(temp_nodes);
+        free(temp_leaf_probs); free(temp_pred_probs);
+        free(temp_stack_nodes); free(temp_stack_weights);
+        free(cv_perm); free(cv_fold_ids); free(cv_mu_buf);
+        free(cv_losses); free(cv_valid);
+        free(cv_class_left); free(cv_class_right);
+
+        if (status < 0) {
+            free(nodes);
+            PyErr_SetString(PyExc_RuntimeError,
+                            "C classifier lookahead tree grower failed");
+            goto cla_grow_fail;
+        }
+
+        npy_intp dims[1] = {node_count};
+        PyArrayObject *features_arr2   = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_INT64);
+        PyArrayObject *node_thr_arr    = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+        PyArrayObject *margins_arr2    = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+        PyArrayObject *lefts_arr2      = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_INT64);
+        PyArrayObject *rights_arr2     = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_INT64);
+        PyArrayObject *values_arr2     = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+        PyArrayObject *n_samples_arr2  = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+        PyArrayObject *imps_arr2       = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+        PyArrayObject *nan_left_arr2   = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_BOOL);
+
+        if (!features_arr2 || !node_thr_arr || !margins_arr2 ||
+            !lefts_arr2    || !rights_arr2  || !values_arr2  ||
+            !n_samples_arr2|| !imps_arr2    || !nan_left_arr2) {
+            Py_XDECREF(features_arr2); Py_XDECREF(node_thr_arr);
+            Py_XDECREF(margins_arr2);  Py_XDECREF(lefts_arr2);
+            Py_XDECREF(rights_arr2);   Py_XDECREF(values_arr2);
+            Py_XDECREF(n_samples_arr2);Py_XDECREF(imps_arr2);
+            Py_XDECREF(nan_left_arr2);
+            free(nodes);
+            goto cla_grow_fail;
+        }
+
+        npy_int64 *features_out  = (npy_int64 *)PyArray_DATA(features_arr2);
+        double    *thr_out       = (double    *)PyArray_DATA(node_thr_arr);
+        double    *margins_out   = (double    *)PyArray_DATA(margins_arr2);
+        npy_int64 *lefts_out     = (npy_int64 *)PyArray_DATA(lefts_arr2);
+        npy_int64 *rights_out    = (npy_int64 *)PyArray_DATA(rights_arr2);
+        double    *values_out    = (double    *)PyArray_DATA(values_arr2);
+        double    *samples_out   = (double    *)PyArray_DATA(n_samples_arr2);
+        double    *imps_out      = (double    *)PyArray_DATA(imps_arr2);
+        npy_bool  *nan_left_out  = (npy_bool  *)PyArray_DATA(nan_left_arr2);
+
+        for (int i = 0; i < node_count; ++i) {
+            features_out[i] = nodes[i].feature;
+            thr_out[i]      = nodes[i].threshold;
+            margins_out[i]  = nodes[i].margin;
+            lefts_out[i]    = nodes[i].left;
+            rights_out[i]   = nodes[i].right;
+            values_out[i]   = nodes[i].value;
+            samples_out[i]  = nodes[i].n_samples;
+            imps_out[i]     = nodes[i].impurity_reduction;
+            nan_left_out[i] = nodes[i].nan_go_left ? 1 : 0;
+        }
+        free(nodes);
+
+        Py_DECREF(X_arr); Py_DECREF(X_bins_arr); Py_DECREF(y_arr);
+        Py_DECREF(w_arr); Py_DECREF(Xv_arr); Py_DECREF(yv_arr);
+        Py_DECREF(wv_arr); Py_DECREF(thresholds_arr);
+        Py_DECREF(centers_arr); Py_DECREF(n_thresholds_arr);
+
+        return Py_BuildValue("NNNNNNNNN",
+            (PyObject *)features_arr2, (PyObject *)node_thr_arr,
+            (PyObject *)margins_arr2,  (PyObject *)lefts_arr2,
+            (PyObject *)rights_arr2,   (PyObject *)values_arr2,
+            (PyObject *)n_samples_arr2,(PyObject *)imps_arr2,
+            (PyObject *)nan_left_arr2);
+    }
+
+cla_grow_fail:
+    Py_XDECREF(X_arr); Py_XDECREF(X_bins_arr); Py_XDECREF(y_arr);
+    Py_XDECREF(w_arr); Py_XDECREF(Xv_arr); Py_XDECREF(yv_arr);
+    Py_XDECREF(wv_arr); Py_XDECREF(thresholds_arr);
+    Py_XDECREF(centers_arr); Py_XDECREF(n_thresholds_arr);
+    return NULL;
+}
+
 /*
  * Diagonal leaf-stat accumulation: traverses each sample through the flat
  * numeric tree, accumulating per-leaf numerator and denominator for the
@@ -1443,6 +4194,10 @@ static PyMethodDef methods[] = {
      "Predict a numeric fuzzy tree stored as flat arrays."},
     {"grow_depth_first_regression",grow_depth_first_regression,METH_VARARGS,
      "Grow a full numeric regression tree with depth-first fuzzy splits."},
+    {"grow_lookahead_regression",  grow_lookahead_regression,  METH_VARARGS,
+     "Grow a numeric regression tree with C-accelerated lookahead splits."},
+    {"grow_lookahead_classifier",  grow_lookahead_classifier,  METH_VARARGS,
+     "Grow a numeric classifier tree with C-accelerated lookahead splits."},
     {"accumulate_leaf_stats",      accumulate_leaf_stats,      METH_VARARGS,
      "Diagonal leaf-stat accumulation for fast leaf-value optimisation."},
     {NULL, NULL, 0, NULL}

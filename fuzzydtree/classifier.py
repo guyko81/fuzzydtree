@@ -9,7 +9,12 @@ criterion is logit-MSE/Gini; entropy remains available as an option.
 import numpy as np
 from numba import njit, prange
 
-from ._tree import FuzzyDTree, _membership_value
+from ._tree import FuzzyDTree, _Node, _membership_value
+
+try:
+    from . import _c_backend
+except ImportError:
+    _c_backend = None
 
 
 # ------------------------------------------------------------------
@@ -251,17 +256,66 @@ class FuzzyTreeClassifier(FuzzyDTree):
     refine_splits_candidates : int, default=4
         Number of threshold and margin candidates tried around each split.
 
-    All other parameters are inherited from FuzzyDTree.
+    Inherited from FuzzyDTree (see its docstring for full descriptions)
+    ------------------------------------------------------------------
+    max_depth : int, default=5
+    max_leaves : int or None, default=None
+    min_samples_leaf : float, default=1.0
+    max_features : int, float, {'sqrt', 'log2'} or None, default=None
+    categorical_features : list of int, 'auto', or None, default=None
+    max_cat_threshold : int, default=64
+    random_state : int or None, default=None
+    margin_grid_size : int, default=10
+    margin_min_scale : float, default=1e-4
+    margin_max_scale : float, default=20.0
+    include_hard_splits : bool, default=True
+    margin_cv_folds : int, default=10
+    margin_cv_repeats : int, default=3
+    lookahead_horizon : int, default=0
+    lookahead_candidates : int, default=4
+    lookahead_val_fraction : float, default=0.3
+    lookahead_min_val : float, default=5.0
+    max_bins : int, default=256
+    margin_depth_decay : float, default=1.0
+    min_train_weight_fraction : float, default=0.01
+    prebin_numeric : bool, default=True
     """
 
-    def __init__(self, *, split_criterion="logit_mse",
+    def __init__(self, *,
+                 # --- inherited FuzzyDTree parameters (listed for IDE hover) ---
+                 max_depth=5, max_leaves=None, min_samples_leaf=1.0,
+                 max_features=None, categorical_features=None,
+                 max_cat_threshold=64, random_state=None,
+                 margin_grid_size=10, margin_min_scale=1e-4,
+                 margin_max_scale=20.0, include_hard_splits=True,
+                 max_bins=256, margin_depth_decay=1.0,
+                 min_train_weight_fraction=0.01, prebin_numeric=True,
+                 margin_cv_folds=10, margin_cv_repeats=3,
+                 lookahead_horizon=0, lookahead_candidates=4,
+                 lookahead_val_fraction=0.3, lookahead_min_val=5.0,
+                 # --- classifier-specific parameters ---
+                 split_criterion="logit_mse",
                  leaf_prediction="frequency", leaf_logit_l2=1e-2,
                  leaf_logit_target=4.0, leaf_logit_ce_max_iter=100,
                  leaf_logit_ce_lr=1.0, leaf_logit_ce_tol=1e-6,
                  optimize_leaf_values=False, refine_splits=False,
-                 refine_splits_max_iter=1, refine_splits_candidates=4,
-                 **kwargs):
-        super().__init__(**kwargs)
+                 refine_splits_max_iter=1, refine_splits_candidates=4):
+        super().__init__(
+            max_depth=max_depth, max_leaves=max_leaves,
+            min_samples_leaf=min_samples_leaf, max_features=max_features,
+            categorical_features=categorical_features,
+            max_cat_threshold=max_cat_threshold, random_state=random_state,
+            margin_grid_size=margin_grid_size, margin_min_scale=margin_min_scale,
+            margin_max_scale=margin_max_scale,
+            include_hard_splits=include_hard_splits, max_bins=max_bins,
+            margin_depth_decay=margin_depth_decay,
+            min_train_weight_fraction=min_train_weight_fraction,
+            prebin_numeric=prebin_numeric, margin_cv_folds=margin_cv_folds,
+            margin_cv_repeats=margin_cv_repeats,
+            lookahead_horizon=lookahead_horizon,
+            lookahead_candidates=lookahead_candidates,
+            lookahead_val_fraction=lookahead_val_fraction,
+            lookahead_min_val=lookahead_min_val)
         self.split_criterion = split_criterion
         self.leaf_prediction = leaf_prediction
         self.leaf_logit_l2 = leaf_logit_l2
@@ -333,6 +387,25 @@ class FuzzyTreeClassifier(FuzzyDTree):
         true_p = np.clip(true_p, 1e-12, 1.0)
         return float(-(w_val @ np.log(true_p)))
 
+    def _la_leaf_value(self, y, w):
+        """Class-probability vector stored at a rollout leaf."""
+        s = w.sum()
+        p = np.zeros(self.n_classes_, dtype=np.float64)
+        if s > 1e-12:
+            np.add.at(p, y.astype(np.intp), w)
+            p /= s
+        else:
+            p[:] = 1.0 / self.n_classes_
+        return p
+
+    @staticmethod
+    def _la_loss(y, w, pred):
+        """Weighted log-loss of a rollout subtree's blended probabilities."""
+        s = w.sum()
+        pt = np.clip(pred[np.arange(len(y)), y.astype(np.intp)], 1e-12, 1.0)
+        return float(-(w @ np.log(pt)) / s) if s > 1e-12 else \
+            float(-np.mean(np.log(pt)))
+
     @staticmethod
     def _compute_gini_impurity(y, w, n_classes=None):
         s = w.sum()
@@ -402,6 +475,117 @@ class FuzzyTreeClassifier(FuzzyDTree):
             candidates, margins,
             min_samples_leaf, nan_mu, self.n_classes_)
 
+    def _try_build_c_lookahead(self, X, y, w, X_bins):
+        if _c_backend is None:
+            return None
+        if not hasattr(_c_backend, "grow_lookahead_classifier"):
+            return None
+        if X_bins is None:
+            return None
+        if self.max_features is not None:
+            return None
+        if getattr(self, "is_categorical_", None) is None:
+            return None
+        if self.is_categorical_.any():
+            return None
+        if int(self.max_depth) > 20 or int(self.lookahead_horizon) > 12:
+            return None
+
+        rng = np.random.RandomState(
+            0 if self.random_state is None else self.random_state)
+        val = rng.random(X.shape[0]) < float(self.lookahead_val_fraction)
+        if val.sum() < 2 or (~val).sum() < 2:
+            return None
+
+        packed = self._pack_numeric_bins_for_c()
+        if packed is None:
+            return None
+        thresholds, centers, n_thresholds = packed
+        split_criterion = 1 if self.split_criterion == "entropy" else 0
+
+        arrays = _c_backend.grow_lookahead_classifier(
+            np.ascontiguousarray(X[~val], dtype=np.float64),
+            np.ascontiguousarray(X_bins[~val], dtype=np.int32),
+            np.ascontiguousarray(y[~val], dtype=np.float64),
+            np.ascontiguousarray(w[~val], dtype=np.float64),
+            np.ascontiguousarray(X[val], dtype=np.float64),
+            np.ascontiguousarray(y[val], dtype=np.float64),
+            np.ascontiguousarray(w[val], dtype=np.float64),
+            thresholds,
+            centers,
+            n_thresholds,
+            int(self.max_depth),
+            float(self.min_samples_leaf),
+            int(self.margin_grid_size),
+            float(self.margin_min_scale),
+            float(self.margin_max_scale),
+            bool(self.include_hard_splits),
+            float(self.margin_depth_decay),
+            float(self.min_train_weight_fraction),
+            int(self.lookahead_horizon),
+            int(self.lookahead_candidates),
+            float(self.lookahead_min_val),
+            int(self.margin_cv_folds),
+            int(self.margin_cv_repeats),
+            0 if self.random_state is None else int(self.random_state),
+            int(self.n_classes_),
+            int(split_criterion),
+        )
+        root = self._tree_from_c_arrays(arrays)
+        self._la_refit_values(root, X, y, w)
+        return root
+
+    def _pack_numeric_bins_for_c(self):
+        if not self._bin_thresholds_:
+            return None
+        n_features = len(self._bin_thresholds_)
+        max_thresholds = max(
+            [len(t) for t in self._bin_thresholds_ if t is not None] + [0])
+        if max_thresholds <= 0:
+            return None
+        thresholds = np.zeros((n_features, max_thresholds), dtype=np.float64)
+        centers = np.zeros((n_features, max_thresholds + 1), dtype=np.float64)
+        n_thresholds = np.zeros(n_features, dtype=np.int32)
+        for j, vals in enumerate(self._bin_thresholds_):
+            if vals is None:
+                continue
+            vals = np.asarray(vals, dtype=np.float64)
+            ctrs = np.asarray(self._bin_centers_[j], dtype=np.float64)
+            n = len(vals)
+            n_thresholds[j] = n
+            thresholds[j, :n] = vals
+            centers[j, :n + 1] = ctrs
+        return (
+            np.ascontiguousarray(thresholds),
+            np.ascontiguousarray(centers),
+            np.ascontiguousarray(n_thresholds),
+        )
+
+    def _tree_from_c_arrays(self, arrays):
+        (features, thresholds, margins, lefts, rights, values,
+         n_samples, imps, nan_left) = arrays
+
+        def build(i):
+            i = int(i)
+            if int(lefts[i]) < 0:
+                return _Node(value=float(values[i]),
+                             n_samples=float(n_samples[i]))
+            return _Node(
+                value=float(values[i]),
+                feature=int(features[i]),
+                threshold=float(thresholds[i]),
+                margin=float(margins[i]),
+                left=build(lefts[i]),
+                right=build(rights[i]),
+                n_samples=float(n_samples[i]),
+                impurity_reduction=float(imps[i]),
+                nan_go_left=bool(nan_left[i]),
+                is_categorical=False,
+                categories_left=None,
+            )
+
+        return build(0)
+
     def _post_fit(self, X, y, w):
         """Fit per-leaf distributions, then optionally refine the splits."""
         leaf_weights = self._fit_leaf_distributions(
@@ -413,7 +597,6 @@ class FuzzyTreeClassifier(FuzzyDTree):
     def _fit_leaf_distributions(self, X, y, w, compute_node_probs=True):
         """Compute per-leaf class probabilities (and optimised leaf logits)."""
         _, leaf_weights = self._collect_all_leaf_weights(X)
-        n_leaves = leaf_weights.shape[1]
         y_int = y.astype(np.int64)
         class_weights = np.zeros((len(y_int), self.n_classes_),
                                  dtype=np.float64)

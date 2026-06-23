@@ -164,7 +164,7 @@ class FuzzyTreeRegressor(FuzzyDTree):
     optimize_split_gain : bool, default=False
         Use exact two-leaf least-squares objective for split evaluation
         instead of the faster weighted child-mean approximation.
-    optimize_leaf_values : bool, default=True
+    optimize_leaf_values : bool, default=False
         After tree building, jointly re-solve all leaf values via
         weighted least-squares.
     leaf_l2 : float, default=1e-1
@@ -175,7 +175,7 @@ class FuzzyTreeRegressor(FuzzyDTree):
     split_gain_l2 : float or 'leaf_l2', default=0.0
         Ridge strength used by the exact two-leaf split objective when
         ``optimize_split_gain=True``. ``'leaf_l2'`` reuses ``leaf_l2``.
-    refine_splits : bool, default=True
+    refine_splits : bool, default=False
         After tree construction, greedily refine numeric thresholds and margins
         against training MSE while keeping the tree topology fixed.
     refine_splits_max_iter : int, default=1
@@ -183,15 +183,65 @@ class FuzzyTreeRegressor(FuzzyDTree):
     refine_splits_candidates : int, default=4
         Number of threshold and margin candidates tried around each split.
 
-    All other parameters are inherited from FuzzyDTree.
+    Inherited from FuzzyDTree (see its docstring for full descriptions)
+    ------------------------------------------------------------------
+    max_depth : int, default=5
+    max_leaves : int or None, default=None
+    min_samples_leaf : float, default=1.0
+    max_features : int, float, {'sqrt', 'log2'} or None, default=None
+    categorical_features : list of int, 'auto', or None, default=None
+    max_cat_threshold : int, default=64
+    random_state : int or None, default=None
+    margin_grid_size : int, default=10
+    margin_min_scale : float, default=1e-4
+    margin_max_scale : float, default=20.0
+    include_hard_splits : bool, default=True
+    margin_cv_folds : int, default=10
+    margin_cv_repeats : int, default=3
+    lookahead_horizon : int, default=0
+    lookahead_candidates : int, default=4
+    lookahead_val_fraction : float, default=0.3
+    lookahead_min_val : float, default=5.0
+    max_bins : int, default=256
+    margin_depth_decay : float, default=1.0
+    min_train_weight_fraction : float, default=0.01
+    prebin_numeric : bool, default=True
     """
 
-    def __init__(self, *, optimize_split_gain=False,
+    def __init__(self, *,
+                 # --- inherited FuzzyDTree parameters (listed for IDE hover) ---
+                 max_depth=5, max_leaves=None, min_samples_leaf=1.0,
+                 max_features=None, categorical_features=None,
+                 max_cat_threshold=64, random_state=None,
+                 margin_grid_size=10, margin_min_scale=1e-4,
+                 margin_max_scale=20.0, include_hard_splits=True,
+                 max_bins=256, margin_depth_decay=1.0,
+                 min_train_weight_fraction=0.01, prebin_numeric=True,
+                 margin_cv_folds=10, margin_cv_repeats=3,
+                 lookahead_horizon=0, lookahead_candidates=4,
+                 lookahead_val_fraction=0.3, lookahead_min_val=5.0,
+                 # --- regressor-specific parameters ---
+                 optimize_split_gain=False,
                  optimize_leaf_values=False, leaf_l2=1e-1,
                  leaf_l2_mode="centered", split_gain_l2=0.0,
                  refine_splits=False, refine_splits_max_iter=1,
-                 refine_splits_candidates=4, **kwargs):
-        super().__init__(**kwargs)
+                 refine_splits_candidates=4):
+        super().__init__(
+            max_depth=max_depth, max_leaves=max_leaves,
+            min_samples_leaf=min_samples_leaf, max_features=max_features,
+            categorical_features=categorical_features,
+            max_cat_threshold=max_cat_threshold, random_state=random_state,
+            margin_grid_size=margin_grid_size, margin_min_scale=margin_min_scale,
+            margin_max_scale=margin_max_scale,
+            include_hard_splits=include_hard_splits, max_bins=max_bins,
+            margin_depth_decay=margin_depth_decay,
+            min_train_weight_fraction=min_train_weight_fraction,
+            prebin_numeric=prebin_numeric, margin_cv_folds=margin_cv_folds,
+            margin_cv_repeats=margin_cv_repeats,
+            lookahead_horizon=lookahead_horizon,
+            lookahead_candidates=lookahead_candidates,
+            lookahead_val_fraction=lookahead_val_fraction,
+            lookahead_min_val=lookahead_min_val)
         self.optimize_split_gain = optimize_split_gain
         self.optimize_leaf_values = optimize_leaf_values
         self.leaf_l2 = leaf_l2
@@ -242,6 +292,16 @@ class FuzzyTreeRegressor(FuzzyDTree):
         pred = mu_val * left_pred + (1.0 - mu_val) * right_pred
         return float(w_val @ ((y_val - pred) ** 2))
 
+    def _la_leaf_value(self, y, w):
+        return self._wmean(y, w)
+
+    @staticmethod
+    def _la_loss(y, w, pred):
+        s = w.sum()
+        if s <= 1e-12:
+            return float(np.mean((y - pred) ** 2))
+        return float((w @ ((y - pred) ** 2)) / s)
+
     def _eval_numeric_split(self, y, w, bin_assign, bin_centers,
                             candidates, margins, min_samples_leaf, nan_mu):
         split_l2 = self.leaf_l2 if self.split_gain_l2 == "leaf_l2" \
@@ -283,6 +343,66 @@ class FuzzyTreeRegressor(FuzzyDTree):
     # ------------------------------------------------------------------
     # Compiled tree growth
     # ------------------------------------------------------------------
+
+    def _try_build_c_lookahead(self, X, y, w, X_bins):
+        if _c_backend is None:
+            return None
+        if not hasattr(_c_backend, "grow_lookahead_regression"):
+            return None
+        if X_bins is None:
+            return None
+        if self.max_features is not None:
+            # The Python lookahead path draws a fresh feature subset for every
+            # scan, including rollout scans. Keep that exact stochastic path
+            # until the C grower supports the same draw sequence.
+            return None
+        if getattr(self, "is_categorical_", None) is None:
+            return None
+        if self.is_categorical_.any():
+            return None
+        if int(self.max_depth) > 20 or int(self.lookahead_horizon) > 12:
+            return None
+
+        rng = np.random.RandomState(
+            0 if self.random_state is None else self.random_state)
+        val = rng.random(X.shape[0]) < float(self.lookahead_val_fraction)
+        if val.sum() < 2 or (~val).sum() < 2:
+            return None
+
+        packed = self._pack_numeric_bins_for_c()
+        if packed is None:
+            return None
+        thresholds, centers, n_thresholds = packed
+
+        arrays = _c_backend.grow_lookahead_regression(
+            np.ascontiguousarray(X[~val], dtype=np.float64),
+            np.ascontiguousarray(X_bins[~val], dtype=np.int32),
+            np.ascontiguousarray(y[~val], dtype=np.float64),
+            np.ascontiguousarray(w[~val], dtype=np.float64),
+            np.ascontiguousarray(X[val], dtype=np.float64),
+            np.ascontiguousarray(y[val], dtype=np.float64),
+            np.ascontiguousarray(w[val], dtype=np.float64),
+            thresholds,
+            centers,
+            n_thresholds,
+            int(self.max_depth),
+            float(self.min_samples_leaf),
+            int(self.margin_grid_size),
+            float(self.margin_min_scale),
+            float(self.margin_max_scale),
+            bool(self.include_hard_splits),
+            float(self.margin_depth_decay),
+            float(self.min_train_weight_fraction),
+            int(self.lookahead_horizon),
+            int(self.lookahead_candidates),
+            float(self.lookahead_min_val),
+            int(self.margin_cv_folds),
+            int(self.margin_cv_repeats),
+            0 if self.random_state is None else int(self.random_state),
+        )
+        root = self._tree_from_c_arrays(arrays)
+        self._la_refit_values(root, X, y, w)
+        return root
 
     def _try_build_c_depth_first(self, X, y, w, X_bins):
         if _c_backend is None:
